@@ -1,0 +1,29 @@
+---
+# LiteLLM proxy configuration for petrosa-llm-gateway.
+# Callers use only the Petrosa aliases below. Credentials and the provider
+# endpoint come from the environment, which gateway/entrypoint.py fills from
+# mounted Secret files: never write a key or a literal endpoint here.
+model_list:
+  - model_name: petrosa-primary
+    litellm_params:
+      model: openai/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_base: os.environ/PROVIDER_API_BASE
+      api_key: os.environ/PROVIDER_API_KEY
+  - model_name: petrosa-fallback
+    litellm_params:
+      model: openai/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_base: os.environ/PROVIDER_API_BASE
+      api_key: os.environ/PROVIDER_API_KEY
+  - model_name: petrosa-ops
+    litellm_params:
+      model: openai/nvidia/nemotron-3.5-super-vl-120b-a12b
+      api_base: os.environ/PROVIDER_API_BASE
+      api_key: os.environ/PROVIDER_API_KEY
+
+litellm_settings:
+  # Prompt and completion bodies are never logged or stored.
+  turn_off_message_logging: true
+  json_logs: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
