@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any, cast
 
 import fakeredis
 import pytest
@@ -19,7 +20,8 @@ from tests.test_scheduler import RAW, VirtualTime
 
 LONG_AGES = {
     "classes": {
-        name: {**spec, "max_age_s": 10_000} for name, spec in RAW["classes"].items()
+        name: {**spec, "max_age_s": 10_000}
+        for name, spec in cast(dict[str, Any], RAW["classes"]).items()
     }
 }
 
