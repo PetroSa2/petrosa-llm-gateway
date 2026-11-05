@@ -5,4 +5,4 @@ ruff==0.9.9
 mypy==1.15.0
 types-PyYAML==6.0.12.20241230
 bandit==1.7.8
-pre-commit==4.0.1
+pre-commit==4.1.0
