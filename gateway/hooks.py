@@ -124,6 +124,6 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
                 ) from None
             return data
 
-    proxy_handler_instance = SchedulingHook()
+    proxy_handler_instance: Any = SchedulingHook()
 except ImportError:  # pragma: no cover - tests run without LiteLLM
     proxy_handler_instance = None
