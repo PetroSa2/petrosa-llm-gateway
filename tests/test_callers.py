@@ -117,3 +117,28 @@ def test_two_callers_sharing_a_key_is_refused(tmp_path):
 
     with pytest.raises(CredentialError):
         load_caller_keys(env, MASTER)
+
+
+def test_process_keys_load_once_from_the_environment(tmp_path, monkeypatch):
+    from gateway import callers
+
+    env = _setup(tmp_path, {"cio": CIO})
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LITELLM_MASTER_KEY", MASTER)
+    monkeypatch.setattr(callers, "_KEYS", None)
+
+    first = callers._keys()
+
+    assert first.by_key == {CIO: ("cio", "trading")}
+    assert callers._keys() is first  # cached for the process
+
+
+def test_process_keys_need_the_master_key(monkeypatch):
+    from gateway import callers
+
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+    monkeypatch.setattr(callers, "_KEYS", None)
+
+    with pytest.raises(CredentialError):
+        callers._keys()

@@ -143,3 +143,37 @@ async def test_unmeetable_deadline_is_refused_across_replicas():
 def test_stale_after_must_be_positive():
     with pytest.raises(ValueError):
         RedisStore(fakeredis.FakeAsyncRedis(), "x", 0)
+
+
+@pytest.mark.asyncio
+async def test_a_transaction_that_keeps_conflicting_is_refused(monkeypatch):
+    from redis.exceptions import WatchError
+
+    from gateway import redis_store
+
+    config, vt, (one,) = replicas(RAW, count=1)
+    monkeypatch.setattr(redis_store, "MAX_TRANSACTION_RETRIES", 2)
+    attempts = []
+
+    async def always_conflicts(_pipe):
+        attempts.append(1)
+        raise WatchError("another replica wrote")
+
+    with pytest.raises(SchedulingRefused) as refused:
+        await one.store._transaction(always_conflicts)
+
+    assert refused.value.code == "store_contention"
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_ticket_dropped_from_the_shared_queue_expires():
+    config, vt, (one,) = replicas(RAW, count=1)
+    ticket = Ticket("t1", "trading", 0.0, None, queue_key(config, "trading", 0.0))
+    await one.store.enqueue(config, ticket, 0.0)
+    await one.store.remove(ticket)  # e.g. dropped as stale by another replica
+
+    with pytest.raises(SchedulingRefused) as refused:
+        await one.store.try_start(config, ticket, 1.0)
+
+    assert refused.value.code == "queue_expired"
