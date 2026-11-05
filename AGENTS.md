@@ -22,7 +22,7 @@ Run `make pipeline` before opening a pull request, and `make smoke` when the `Do
 ## Facts
 
 - Python: `requires-python = ">=3.11"` for the repository's own code and tests; the image runs the Python bundled with the LiteLLM base image.
-- The proxy image is `ghcr.io/berriai/litellm`, pinned by version and digest in `Dockerfile`.
+- The proxy image is the upstream LiteLLM image (ghcr.io/berriai/litellm), pinned by version and digest in `Dockerfile`.
 - Model aliases are defined in `config/litellm_config.yaml`: `petrosa-primary`, `petrosa-fallback` and `petrosa-ops`. Callers use only these names.
 - `gateway/entrypoint.py` reads the provider key and the proxy master key from mounted Secret files, logs only their fingerprints, and then starts the proxy.
 - `tests/mock_provider.py` is an OpenAI-compatible mock provider used by the tests and by `scripts/smoke.sh`.
