@@ -1,0 +1,27 @@
+[project]
+name = "petrosa-llm-gateway"
+version = "0.1.0"
+description = "In-cluster LLM gateway for the shared AI provider account"
+authors = [{name = "Petrosa Systems"}]
+requires-python = ">=3.11"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gateway*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.coverage.run]
+omit = [".venv/*", "tests/*"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+exclude = ["^\\.venv/"]

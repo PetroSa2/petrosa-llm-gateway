@@ -1,0 +1,27 @@
+---
+# Keeps one AGENTS.md per repository and keeps restricted wording out of
+# pull requests. Both checks are reusable workflows in
+# petrosa-shared-workflows, pinned by commit.
+name: Agent Checks
+
+"on":
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  instructions:
+    name: Agent instructions
+    # yamllint disable-line rule:line-length
+    uses: PetroSa2/petrosa-shared-workflows/.github/workflows/agent-instructions.yml@d6bc307c31ce89b0b295b99e75b9b78755221eff
+    with:
+      shared-ref: d6bc307c31ce89b0b295b99e75b9b78755221eff
+
+  wording:
+    name: External wording
+    # yamllint disable-line rule:line-length
+    uses: PetroSa2/petrosa-shared-workflows/.github/workflows/external-wording.yml@d6bc307c31ce89b0b295b99e75b9b78755221eff
+    with:
+      shared-ref: d6bc307c31ce89b0b295b99e75b9b78755221eff

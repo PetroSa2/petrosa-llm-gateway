@@ -1,0 +1,5 @@
+# Only the gateway package and the proxy config go into the image.
+*
+!gateway/
+!config/litellm_config.yaml
+**/__pycache__

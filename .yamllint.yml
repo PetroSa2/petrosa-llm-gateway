@@ -1,0 +1,17 @@
+extends: default
+
+rules:
+  # GitHub Actions YAML uses sequences at the same indentation level as their
+  # mapping key (steps: / - name:) — this is idiomatic but non-default for yamllint.
+  indentation:
+    indent-sequences: whatever
+  # Allow longer lines in CI workflow files (build-args, run scripts, etc.)
+  line-length:
+    max: 320
+  # GitHub Actions uses 'on:' as a key — allow the bare boolean synonym
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: false
+  # Allow multiple blank lines between jobs/steps for readability
+  empty-lines:
+    max: 2
