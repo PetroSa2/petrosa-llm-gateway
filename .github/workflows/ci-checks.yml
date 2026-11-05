@@ -1,0 +1,29 @@
+---
+name: CI Checks
+
+"on":
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    name: CI Pipeline
+    # yamllint disable-line rule:line-length
+    uses: PetroSa2/petrosa-shared-workflows/.github/workflows/ci-pipeline.yml@6aebf4f0a2d3829dc0b507f6c2ef0a464dcda01c
+    with:
+      service-name: 'llm-gateway'
+      image-name: 'yurisa2/petrosa-llm-gateway'
+      python-version: '3.11'
+      # The image is published once the registry credentials exist
+      # (petrosa-llm-gateway#6); until then the image smoke job below
+      # builds and exercises it without pushing.
+      skip-docker-build: true
+      coverage-threshold: '40'
+    secrets: inherit
