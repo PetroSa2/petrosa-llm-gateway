@@ -259,3 +259,27 @@ async def test_unknown_class_is_refused():
         await scheduler.admit("nobody")
 
     assert refused.value.code == "unknown_class"
+
+
+def test_negative_rank_gap_is_refused():
+    with pytest.raises(ValueError):
+        SchedulingConfig.from_mapping({**RAW, "rank_gap_s": -1})
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_that_passes_in_the_queue_expires():
+    long_ages = {n: {**s, "max_age_s": 10_000} for n, s in RAW["classes"].items()}
+    config, vt, scheduler = make(
+        {**RAW, "classes": long_ages, "rate_per_window": 1, "window_s": 1000}
+    )
+    fill_window(scheduler.store, "trading", 1, at=500.0)  # the window frees at t=1500
+    # Admission estimates one spacing (1000 s) ahead, inside the 1200 s budget; the
+    # window then stays full past the deadline, so the ticket expires on its deadline.
+    waiter = asyncio.create_task(scheduler.admit("trading", budget_s=1200.0))
+    await vt.run_until(waiter.done, limit_s=5000.0)
+
+    with pytest.raises(SchedulingRefused) as refused:
+        await waiter
+    assert refused.value.code == "queue_expired"
+    assert "deadline" in refused.value.detail
+    assert 1200.0 <= vt.now < 1500.0
