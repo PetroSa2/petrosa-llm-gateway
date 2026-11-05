@@ -1,0 +1,29 @@
+---
+# Request scheduling for the shared provider account (petrosa-llm-gateway#2).
+# Read by gateway/scheduler.py (SchedulingConfig.from_mapping).
+classes:
+  trading:   # CIO decision stages
+    rank: 0
+    max_queue: 50
+    max_age_s: 30
+  ops:       # the incident assistant (holmes)
+    rank: 1
+    max_queue: 100
+    max_age_s: 300
+  batch:
+    rank: 2
+    max_queue: 20
+    max_age_s: 900
+# Callers, identified by their mounted static key (file name = caller), and their class.
+callers:
+  cio: trading
+  holmes: ops
+# Labelled fallback rate until the adaptive rate learns it (gw#3): the account's
+# configured rate for the incident assistant today (rpm 10 in its model list).
+rate_per_window: 10
+window_s: 60
+reserved_class: trading
+reserved_share: 0.5
+# One rank step is worth this many seconds of waiting (aging bounds ops waits).
+rank_gap_s: 60
+poll_s: 0.25
