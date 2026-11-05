@@ -1,0 +1,2 @@
+# The gateway's own code (gateway/) uses only the standard library.
+# The proxy and its dependencies come from the pinned LiteLLM base image (see Dockerfile).
