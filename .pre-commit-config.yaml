@@ -1,0 +1,54 @@
+# Golden pre-commit configuration for Petrosa services (v3.0).
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.9
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Non-blocking, like CI's own "Run Mypy" step.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: Mypy (non-blocking)
+        entry: scripts/run-mypy-precommit.sh
+        language: python
+        additional_dependencies: ['mypy==1.15.0', 'types-PyYAML']
+        pass_filenames: false
+
+  # Prebuilt gitleaks release binary (no `go install` on a cold cache).
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: Gitleaks (secret detection)
+        entry: scripts/run-gitleaks-precommit.sh
+        language: script
+        pass_filenames: false
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.8
+    hooks:
+      - id: bandit
+        args: [-ll, -r, gateway]
+        exclude: ^tests/
+        pass_filenames: false
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-ast
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: debug-statements
