@@ -3,6 +3,8 @@
 #   - /health/liveliness answers; /health reports every alias healthy against the mock;
 #   - /v1/models lists exactly the Petrosa aliases and refuses a request without the master key;
 #   - a chat completion through an alias reaches the mock;
+#   - a slow primary falls back within the budget; a 429 makes one attempt, no fallback, and
+#     the next request is refused at once with 503 account_throttled (gw#3);
 #   - neither generated key nor the prompt text appears in the container logs or the image.
 # The keys are random per run and exist only in a temporary directory mounted read-only.
 set -euo pipefail
@@ -75,7 +77,6 @@ REPLY="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' "${BASE}/v1/c
 python3 -c 'import json,sys; assert json.load(sys.stdin)["choices"][0]["message"]["content"] == "ok"' <<<"${REPLY}" \
   || fail "unexpected chat reply"
 
-LOGS="$(docker logs "${RUN_ID}-gateway" 2>&1)"
 CALLER=(-H "Authorization: Bearer ${CIO_KEY}")
 CHAT="{\"model\":\"petrosa-primary\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' "${CALLER[@]}" -H 'Content-Type: application/json' "${BASE}/v1/chat/completions" -d "${CHAT}")"
@@ -92,6 +93,51 @@ INFO="$(curl -sf "${AUTH[@]}" "${BASE}/model/info")" || fail "/model/info failed
 for secret in "${PROVIDER_KEY}" "${MASTER_KEY}"; do
   ! grep -qF -- "${secret}" <<<"${INFO}" || fail "/model/info returned a key"
 done
+# gw#3: provider attempts against the mock's programmable behaviour.
+PRIMARY_UP="nvidia/nemotron-3.5-super-vl-120b-a12b"
+FALLBACK_UP="nvidia/nemotron-3.5-lightning-30b-a3b"
+mock() { # mock <method> <path> [json]: the mock's control API, from inside its container
+  docker exec "${RUN_ID}-mock" /app/.venv/bin/python -c '
+import json, sys, urllib.request
+method, path = sys.argv[1], sys.argv[2]
+body = sys.argv[3].encode() if len(sys.argv) > 3 else None
+req = urllib.request.Request("http://127.0.0.1:8080" + path, data=body, method=method,
+                             headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req, timeout=5).read().decode())' "$@"
+}
+calls() { mock GET /_seen | python3 -c 'import json,sys; c=json.load(sys.stdin)["calls"]; print(c.get(sys.argv[1], 0), c.get(sys.argv[2], 0))' "${PRIMARY_UP}" "${FALLBACK_UP}"; }
+
+# A slow primary goes to the fallback inside the caller's budget: the attempt timeout is
+# half the remaining budget, so the fallback still has its half.
+mock POST /_control "{\"reset\": true, \"rules\": {\"${PRIMARY_UP}\": {\"delay_s\": 8, \"times\": 1}}}" >/dev/null
+BEFORE="$(calls)"
+REPLY="$(curl -s -w ' HTTP%{http_code} %{time_total}' "${CALLER[@]}" -H 'Content-Type: application/json' -H 'x-petrosa-deadline-ms: 6000' "${BASE}/v1/chat/completions" -d "${CHAT}")"
+grep -q " HTTP200 " <<<"${REPLY}" || fail "a slow primary did not fall back: ${REPLY: -40}"
+SLOW_S="${REPLY##* }"
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 6.0 else 1)" "${SLOW_S}" || fail "the fallback answered after the 6 s budget (${SLOW_S}s)"
+read -r P0 F0 <<<"${BEFORE}"; read -r P1 F1 <<<"$(calls)"
+[ "$((P1 - P0)) $((F1 - F0))" = "1 1" ] || fail "slow primary: expected one call to each model, got $((P1 - P0)) and $((F1 - F0))"
+
+# A provider 429 throttles the ACCOUNT: one attempt, no fallback (it shares the account),
+# and while the cool-down lasts the next request is refused at once with no provider call.
+mock POST /_control "{\"reset\": true, \"rules\": {\"${PRIMARY_UP}\": {\"status\": 429, \"headers\": {\"retry-after\": \"3\", \"x-ratelimit-remaining-requests\": \"0\"}, \"times\": 1}}}" >/dev/null
+read -r P0 F0 <<<"$(calls)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "${CALLER[@]}" -H 'Content-Type: application/json' "${BASE}/v1/chat/completions" -d "${CHAT}")"
+[ "${CODE}" = "429" ] || fail "the throttled request answered ${CODE}, not the provider's 429"
+read -r P1 F1 <<<"$(calls)"
+[ "$((P1 - P0)) $((F1 - F0))" = "1 0" ] || fail "429: expected one primary call and no fallback, got $((P1 - P0)) and $((F1 - F0))"
+REPLY="$(curl -s -w ' HTTP%{http_code} %{time_total}' "${CALLER[@]}" -H 'Content-Type: application/json' "${BASE}/v1/chat/completions" -d "${CHAT}")"
+grep -q " HTTP503 " <<<"${REPLY}" && grep -q "account_throttled" <<<"${REPLY}" \
+  || fail "a request during the cool-down was not refused with 503 account_throttled: ${REPLY: -60}"
+python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 1.0 else 1)" "${REPLY##* }" || fail "account_throttled took ${REPLY##* }s"
+read -r P2 F2 <<<"$(calls)"
+[ "$((P2 - P1)) $((F2 - F1))" = "0 0" ] || fail "a refused request still reached the provider"
+THROTTLE_LOG="$(docker logs "${RUN_ID}-gateway" 2>&1)" # captured: grep -q on a pipe trips pipefail
+grep -q "provider throttled: rpm=5.0 .*x-ratelimit-remaining-requests" <<<"${THROTTLE_LOG}" \
+  || fail "the 429 was not logged with the halved rate and its rate headers"
+sleep 3.5 # the provider's retry-after
+mock POST /_control '{"reset": true}' >/dev/null
+
 # Requests with a 100 ms budget run while the rate window has room; once it is full
 # (10 per window in config/scheduling.yaml) the next one is refused at once.
 REFUSED=""
@@ -103,6 +149,7 @@ done
 grep -q "deadline_unmeetable" <<<"${REFUSED}" \
   || fail "a full rate window did not refuse an unmeetable deadline with 503 deadline_unmeetable"
 
+LOGS="$(docker logs "${RUN_ID}-gateway" 2>&1)"
 for secret in "${PROVIDER_KEY}" "${MASTER_KEY}" "${CIO_KEY}" "${PROMPT}"; do
   ! grep -qF -- "${secret}" <<<"${LOGS}" || fail "a key or the prompt text appeared in the logs"
 done
@@ -111,4 +158,4 @@ grep -q "PROVIDER_API_KEY loaded from .* (sha256:" <<<"${LOGS}" || fail "no prov
 IMAGE_ENV="$(docker image inspect "${IMAGE}" --format '{{json .Config.Env}}')"
 ! grep -qE "PROVIDER_API_KEY|LITELLM_MASTER_KEY" <<<"${IMAGE_ENV}" || fail "a key variable is baked into the image"
 
-echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 probes=200-no-key logs=no-keys"
+echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 slow-primary=fallback 429=one-attempt+account_throttled probes=200-no-key logs=no-keys"
