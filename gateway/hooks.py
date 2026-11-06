@@ -22,7 +22,7 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,7 @@ from gateway.attempts import (
     decide,
     remaining_budget,
 )
+from gateway.metrics import GatewayMetrics
 from gateway.scheduler import (
     InMemoryStore,
     Scheduler,
@@ -61,8 +62,9 @@ DEADLINE_HEADER = "x-petrosa-deadline-ms"
 DEFAULT_CLASS = "batch"
 #: A replica that stops polling for this many polls has died; its tickets go stale.
 STALE_AFTER_POLLS = 20
-#: Request metadata key carrying the admitted class to the later attempts.
+#: Request metadata keys carrying the admitted class and caller to the later attempts.
 CLASS_KEY = "petrosa_class"
+CALLER_KEY = "petrosa_caller"
 
 
 def budget_from_headers(headers: Mapping[str, Any] | None) -> float | None:
@@ -106,6 +108,16 @@ def load_fallbacks(path: str | Path) -> dict[str, list[str]]:
     return chains
 
 
+def load_aliases(path: str | Path) -> list[str]:
+    """The Petrosa aliases callers may use, from the LiteLLM config's model list."""
+    raw = yaml.safe_load(Path(path).read_text()) or {}
+    return [
+        str(entry["model_name"])
+        for entry in raw.get("model_list") or []
+        if isinstance(entry, dict) and entry.get("model_name")
+    ]
+
+
 def is_throttle(exception: BaseException | None) -> bool:
     """A provider 429: the account is throttled."""
     if exception is None:
@@ -137,11 +149,39 @@ class GatewayPolicy:
         rates: RateStore,
         clock: Any,
         fallbacks: Mapping[str, list[str]] | None = None,
+        metrics: GatewayMetrics | None = None,
+        aliases: Iterable[str] = (),
+        callers: Iterable[str] = (),
     ) -> None:
         self.scheduler = scheduler
         self.rates = rates
         self.clock = clock
         self.fallbacks = dict(fallbacks or {})
+        self.metrics = metrics
+        self.aliases = frozenset(aliases)
+        self.callers = frozenset(callers)
+
+    def _alias(self, alias: Any) -> str:
+        """A bounded metric label: a configured Petrosa alias, else ``other``."""
+        return alias if isinstance(alias, str) and alias in self.aliases else "other"
+
+    def _caller(self, caller: Any) -> str:
+        """A bounded metric label: a configured caller, else ``gateway`` (the master key)."""
+        return (
+            caller if isinstance(caller, str) and caller in self.callers else "gateway"
+        )
+
+    async def _observe(self, now: float) -> None:
+        """Refresh the rate, cool-down and queue-depth gauges from the shared state."""
+        if self.metrics is None:
+            return
+        state = await self.rates.load()
+        self.metrics.set_rate(state.rpm, state.tpm, state.cooldown_until - now)
+        queue, _window = await self.scheduler.store.snapshot(now)
+        waiting: dict[str, int] = {}
+        for ticket in queue:
+            waiting[ticket.cls] = waiting.get(ticket.cls, 0) + 1
+        self.metrics.set_queue_depth(self.scheduler.config.classes, waiting)
 
     async def on_request(
         self,
@@ -151,17 +191,30 @@ class GatewayPolicy:
     ) -> None:
         """Refuse during a cool-down; otherwise wait for a slot and set the attempt timeout."""
         now = self.clock()
-        state = await self.rates.load()
-        if throttled(state, now):
-            raise SchedulingRefused(
-                "account_throttled",
-                f"provider account cooling down for {state.cooldown_until - now:.1f}s",
-            )
+        caller = self._caller((auth_metadata or {}).get("caller"))
         cls = request_class(auth_metadata, self.scheduler.config)
-        budget = budget_from_headers(headers)
-        await self.scheduler.admit(cls, budget)
+        alias = self._alias(data.get("model"))
+        try:
+            state = await self.rates.load()
+            if throttled(state, now):
+                raise SchedulingRefused(
+                    "account_throttled",
+                    f"provider account cooling down for {state.cooldown_until - now:.1f}s",
+                )
+            budget = budget_from_headers(headers)
+            await self.scheduler.admit(cls, budget)
+        except SchedulingRefused as refused:
+            if self.metrics is not None:
+                self.metrics.admission(caller, cls, refused.code, self.clock() - now)
+                self.metrics.attempt(caller, cls, alias, refused.code)
+                await self._observe(self.clock())
+            raise
+        if self.metrics is not None:
+            self.metrics.admission(caller, cls, "started", self.clock() - now)
+            await self._observe(self.clock())
         metadata = data.setdefault("metadata", {})
         metadata[CLASS_KEY] = cls
+        metadata[CALLER_KEY] = caller
         if budget is not None:
             metadata[DEADLINE_AT_KEY] = now + budget
             remaining = max(0.0, now + budget - self.clock())
@@ -170,26 +223,39 @@ class GatewayPolicy:
             if timeout is not None:
                 data["timeout"] = timeout
 
-    async def on_attempt(self, metadata: Mapping[str, Any] | None) -> None:
-        """Count a later provider attempt in the rate, or refuse it after a 429."""
-        decision = decide(metadata)
-        if decision is Attempt.FIRST:
-            return
-        if decision is Attempt.REFUSE_THROTTLED:
-            raise SchedulingRefused(
-                "account_throttled", "provider 429: no fallback on the same account"
-            )
-        has_deadline, remaining = remaining_budget(metadata, self.clock())
-        if has_deadline and not remaining:
-            raise SchedulingRefused(
-                "deadline_unmeetable", "no budget left for a fallback"
-            )
-        cls = (metadata or {}).get(CLASS_KEY)
+    async def on_attempt(
+        self, metadata: Mapping[str, Any] | None, alias: Any = None
+    ) -> None:
+        """Count a provider attempt; a later one takes a slot, or is refused after a 429."""
+        metadata = metadata or {}
+        cls = metadata.get(CLASS_KEY)
         if not isinstance(cls, str) or cls not in self.scheduler.config.classes:
             cls = DEFAULT_CLASS
-        await self.scheduler.admit(cls, remaining)
+        caller = self._caller(metadata.get(CALLER_KEY))
+        label = self._alias(alias or metadata.get("model_group"))
+        try:
+            decision = decide(metadata)
+            if decision is Attempt.REFUSE_THROTTLED:
+                raise SchedulingRefused(
+                    "account_throttled", "provider 429: no fallback on the same account"
+                )
+            if decision is Attempt.ADMIT:
+                has_deadline, remaining = remaining_budget(metadata, self.clock())
+                if has_deadline and not remaining:
+                    raise SchedulingRefused(
+                        "deadline_unmeetable", "no budget left for a fallback"
+                    )
+                await self.scheduler.admit(cls, remaining)
+        except SchedulingRefused as refused:
+            if self.metrics is not None:
+                self.metrics.attempt(caller, cls, label, refused.code)
+            raise
+        if self.metrics is not None:
+            self.metrics.attempt(caller, cls, label, "started")
 
-    async def on_failure(self, exception: BaseException | None) -> bool:
+    async def on_failure(
+        self, exception: BaseException | None, alias: Any = None
+    ) -> bool:
         """A provider 429 halves the shared rate and starts the cool-down; True when it did."""
         if not is_throttle(exception):
             return False
@@ -205,6 +271,9 @@ class GatewayPolicy:
             state.throttles,
             rate_headers(headers),
         )
+        if self.metrics is not None:
+            self.metrics.throttled(self._alias(alias))
+            await self._observe(now)
         return True
 
     async def on_success(self) -> None:
@@ -222,6 +291,7 @@ class GatewayPolicy:
         saturated = len(recent) >= config.rate_per_window
         if on_clean(state, now, saturated) != state:
             await self.rates.update(lambda s: on_clean(s, now, saturated))
+            await self._observe(now)
 
 
 def build_scheduler(
@@ -267,13 +337,27 @@ def build_rates(environ: Mapping[str, str]) -> RateStore:
     return InMemoryRateStore()
 
 
-def build_policy(environ: Mapping[str, str]) -> GatewayPolicy:
-    """Scheduler, rate store and fallback chains, from the mounted configs."""
+def build_policy(
+    environ: Mapping[str, str], metrics: GatewayMetrics | None = None
+) -> GatewayPolicy:
+    """Scheduler, rate store, fallback chains and aliases, from the mounted configs."""
     rates = build_rates(environ)
-    fallbacks = load_fallbacks(
-        environ.get("GATEWAY_CONFIG", "/etc/llm-gateway/litellm_config.yaml")
+    litellm_config = environ.get(
+        "GATEWAY_CONFIG", "/etc/llm-gateway/litellm_config.yaml"
     )
-    return GatewayPolicy(build_scheduler(environ, rates), rates, time.time, fallbacks)
+    scheduling = Path(
+        environ.get("GATEWAY_SCHEDULING", "/etc/llm-gateway/scheduling.yaml")
+    )
+    callers = (yaml.safe_load(scheduling.read_text()) or {}).get("callers") or {}
+    return GatewayPolicy(
+        build_scheduler(environ, rates),
+        rates,
+        time.time,
+        load_fallbacks(litellm_config),
+        metrics,
+        load_aliases(litellm_config),
+        callers,
+    )
 
 
 try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
@@ -286,11 +370,15 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
         def __init__(self) -> None:
             super().__init__()
             self._policy: GatewayPolicy | None = None
+            self._metrics = GatewayMetrics()
+            from gateway.metrics import serve
+
+            serve(os.environ)
 
         @property
         def policy(self) -> GatewayPolicy:
             if self._policy is None:
-                self._policy = build_policy(os.environ)
+                self._policy = build_policy(os.environ, self._metrics)
             return self._policy
 
         @staticmethod
@@ -312,7 +400,8 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
 
         async def async_pre_call_deployment_hook(self, kwargs, call_type):
             try:
-                await self.policy.on_attempt(kwargs.get("metadata"))
+                metadata = kwargs.get("metadata") or {}
+                await self.policy.on_attempt(metadata, metadata.get("model_group"))
             except SchedulingRefused as refused:
                 raise self._refusal(refused) from None
             return None
@@ -320,7 +409,9 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
         async def async_log_failure_event(
             self, kwargs, response_obj, start_time, end_time
         ):
-            await self.policy.on_failure(kwargs.get("exception"))
+            await self.policy.on_failure(
+                kwargs.get("exception"), kwargs.get("model_group")
+            )
 
         async def async_log_success_event(
             self, kwargs, response_obj, start_time, end_time

@@ -6,6 +6,7 @@ import logging
 
 import fakeredis
 import pytest
+from prometheus_client import CollectorRegistry
 
 from gateway import hooks
 from gateway.adaptive_rate import (
@@ -15,6 +16,7 @@ from gateway.adaptive_rate import (
     RedisRateStore,
 )
 from gateway.attempts import DEADLINE_AT_KEY
+from gateway.metrics import GatewayMetrics
 from gateway.redis_store import RedisStore
 from gateway.scheduler import (
     InMemoryStore,
@@ -339,3 +341,89 @@ def test_build_rates_uses_redis_when_configured():
         {"REDIS_URL": "redis://redis.invalid:6379/0", "GATEWAY_REDIS_PREFIX": "gw"}
     )
     assert isinstance(rates, RedisRateStore) and rates.key == "gw:rate"
+
+
+ALIASES = ["petrosa-primary", "petrosa-fallback", "petrosa-ops"]
+
+
+def measured_policy():
+    registry = CollectorRegistry()
+    gateway, vt, store = policy()
+    gateway.metrics = GatewayMetrics(registry)
+    gateway.aliases = frozenset(ALIASES)
+    gateway.callers = frozenset({"cio", "holmes"})
+    return gateway, vt, store, registry.get_sample_value
+
+
+@pytest.mark.asyncio
+async def test_metrics_follow_requests_attempts_and_throttles():
+    gateway, vt, _, value = measured_policy()
+    data = {"model": "petrosa-primary"}
+
+    await gateway.on_request(TRADING, None, data)
+    await gateway.on_attempt(data["metadata"], "petrosa-primary")
+    await gateway.on_failure(RateLimitError({"retry-after": "5"}), "petrosa-primary")
+    with pytest.raises(SchedulingRefused):
+        await gateway.on_attempt(
+            {**data["metadata"], "previous_models": _previous("RateLimitError")},
+            "petrosa-fallback",
+        )
+    with pytest.raises(SchedulingRefused):
+        await gateway.on_request(TRADING, None, {"model": "petrosa-primary"})
+
+    def attempts(alias, outcome):
+        labels = {"caller": "cio", "class": "trading", "alias": alias}
+        return value("llm_gateway_attempts_total", {**labels, "outcome": outcome})
+
+    assert attempts("petrosa-primary", "started") == 1
+    assert attempts("petrosa-fallback", "account_throttled") == 1
+    assert attempts("petrosa-primary", "account_throttled") == 1  # refused pre-call
+    assert (
+        value("llm_gateway_provider_throttles_total", {"alias": "petrosa-primary"}) == 1
+    )
+    assert value("llm_gateway_rate_rpm") == COLD_START_RPM / 2
+    assert value("llm_gateway_cooldown_seconds") == 5.0
+    assert value("llm_gateway_queue_depth", {"class": "trading"}) == 0
+    started = {"caller": "cio", "class": "trading", "outcome": "started"}
+    assert value("llm_gateway_wait_seconds_count", started) == 1
+
+
+@pytest.mark.asyncio
+async def test_metric_labels_stay_bounded():
+    gateway, _, _, value = measured_policy()
+
+    await gateway.on_request(
+        {"caller": "someone-new", "priority_class": "trading"},
+        None,
+        {"model": "not-a-petrosa-alias"},
+    )
+    await gateway.on_attempt({}, "not-a-petrosa-alias")
+
+    assert (
+        value(
+            "llm_gateway_attempts_total",
+            {
+                "caller": "gateway",
+                "class": "batch",
+                "alias": "other",
+                "outcome": "started",
+            },
+        )
+        == 1
+    )
+
+
+def test_build_policy_reads_aliases_and_callers_from_the_shipped_configs():
+    gateway = hooks.build_policy(
+        {
+            "GATEWAY_SCHEDULING": "config/scheduling.yaml",
+            "GATEWAY_CONFIG": "config/litellm_config.yaml",
+        }
+    )
+
+    assert gateway.aliases == frozenset(ALIASES)
+    assert gateway.callers == frozenset({"cio", "holmes"})
+    assert gateway.fallbacks == {
+        "petrosa-primary": ["petrosa-fallback"],
+        "petrosa-ops": ["petrosa-fallback"],
+    }
