@@ -15,7 +15,7 @@ from __future__ import annotations
 import itertools
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 
@@ -224,6 +224,11 @@ class InMemoryStore:
 _SEQUENCE = itertools.count()
 
 
+#: The learned provider rate in requests per minute (``gateway.adaptive_rate``), read on
+#: every decision so a 429 on one replica slows every replica at once.
+RateSource = Callable[[], Awaitable[float]]
+
+
 class Scheduler:
     """Admits requests in priority order within the shared rate."""
 
@@ -233,12 +238,25 @@ class Scheduler:
         store: Store,
         clock: Callable[[], float],
         sleep: Callable[[float], Awaitable[None]],
+        rate: RateSource | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.store = store
         self.clock = clock
         self.sleep = sleep
+        self.rate = rate
+
+    async def effective_config(self) -> SchedulingConfig:
+        """The config with the learned rate in place of ``rate_per_window`` (gw#3).
+
+        Without a rate source the configured rate applies. The learned rate is in requests
+        per minute and is scaled to the window.
+        """
+        if self.rate is None:
+            return self.config
+        rpm = await self.rate()
+        return replace(self.config, rate_per_window=rpm * self.config.window_s / 60.0)
 
     async def admit(self, cls: str, budget_s: float | None = None) -> Ticket:
         """Wait until this request may start; raise ``SchedulingRefused`` when it never can.
@@ -258,7 +276,8 @@ class Scheduler:
         )
         if deadline is not None:
             queue, window = await self.store.snapshot(now)
-            if estimated_start(self.config, ticket, queue, window, now) > deadline:
+            config = await self.effective_config()
+            if estimated_start(config, ticket, queue, window, now) > deadline:
                 raise SchedulingRefused(
                     "deadline_unmeetable", f"class {cls} budget {budget_s:.3f}s"
                 )
@@ -266,7 +285,8 @@ class Scheduler:
         try:
             while True:
                 now = self.clock()
-                if await self.store.try_start(self.config, ticket, now):
+                config = await self.effective_config()
+                if await self.store.try_start(config, ticket, now):
                     return ticket
                 if deadline is not None and now >= deadline:
                     raise SchedulingRefused("queue_expired", "deadline passed in queue")

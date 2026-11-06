@@ -283,3 +283,54 @@ async def test_a_deadline_that_passes_in_the_queue_expires():
     assert refused.value.code == "queue_expired"
     assert "deadline" in refused.value.detail
     assert 1200.0 <= vt.now < 1500.0
+
+
+@pytest.mark.asyncio
+async def test_the_learned_rate_replaces_the_configured_rate():
+    """gw#3: the window follows the rate the adaptive store learned, read on every decision."""
+    long_ages = {
+        name: {**spec, "max_age_s": 10_000} for name, spec in RAW["classes"].items()
+    }
+    config = SchedulingConfig.from_mapping({**RAW, "classes": long_ages})
+    vt = VirtualTime()
+    learned = {"rpm": 4.0}
+
+    async def rate() -> float:
+        return learned["rpm"]
+
+    scheduler = Scheduler(config, InMemoryStore(), vt.clock, vt.sleep, rate)
+    assert (await scheduler.effective_config()).rate_per_window == 4.0
+    starts: list[float] = []
+
+    async def call():
+        await scheduler.admit("trading")
+        starts.append(vt.now)
+
+    tasks = [asyncio.create_task(call()) for _ in range(12)]
+    await vt.run_until(lambda: len(starts) == 12, limit_s=1000.0)
+
+    for at in starts:
+        assert len([s for s in starts if at - config.window_s < s <= at]) <= 4
+    assert (
+        len([s for s in starts if s < config.window_s]) == 4
+    )  # the configured 10 never applied
+    await asyncio.gather(*tasks)
+
+    learned["rpm"] = 2.0  # halved after a 429 on another replica
+    assert (await scheduler.effective_config()).rate_per_window == 2.0
+
+
+@pytest.mark.asyncio
+async def test_a_slower_learned_rate_makes_a_deadline_unmeetable():
+    config, vt, _ = make()
+    store = InMemoryStore()
+    fill_window(store, "trading", 1, at=0.0)
+
+    async def rate() -> float:
+        return 1.0  # the floor: one request per minute
+
+    scheduler = Scheduler(config, store, vt.clock, vt.sleep, rate)
+    with pytest.raises(SchedulingRefused) as refused:
+        await scheduler.admit("trading", budget_s=30.0)
+
+    assert refused.value.code == "deadline_unmeetable"
