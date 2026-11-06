@@ -37,9 +37,24 @@ def test_a_429_halves_the_rate_and_it_recovers_by_one_per_clean_minute():
     assert on_clean(state, 189.0) == state  # less than one clean minute after it
     one = on_clean(state, 190.0)
     assert (one.rpm, one.tpm) == (7, 14_000)
-    three = on_clean(one, 310.0)
-    assert three.rpm == 9
-    assert on_clean(three, 310.0) == three  # idempotent within the minute
+    assert on_clean(one, 249.0) == one  # the next step needs another clean minute
+    two = on_clean(one, 250.0)
+    assert two.rpm == 8
+    assert on_clean(two, 250.0) == two  # idempotent within the minute
+
+
+def test_idle_minutes_add_nothing_and_a_cold_record_only_starts_the_clock():
+    """A quiet hour is not evidence the account takes more (smoke test, 2026-11-06: a cold
+    record counted every minute since the epoch as clean)."""
+    cold = RateState()
+    started = on_clean(cold, 1_700_000_000.0)
+    assert started.rpm == COLD_START_RPM and started.last_change_at == 1_700_000_000.0
+
+    after_an_idle_hour = on_clean(started, 1_700_003_600.0)
+    assert after_an_idle_hour.rpm == COLD_START_RPM + 1  # one step, not sixty
+
+    not_binding = on_clean(after_an_idle_hour, 1_700_003_700.0, saturated=False)
+    assert not_binding == after_an_idle_hour  # the rate was not the limit: no growth
 
 
 def test_repeated_429s_never_go_below_the_floor():
@@ -114,7 +129,9 @@ async def test_two_replicas_share_the_state_and_it_survives_a_restart():
 
     await one.update(lambda s: on_throttled(s, 0.0, 30))
     seen_by_two = await two.load()
-    await two.update(lambda s: on_clean(s, 90.0))
+    await two.update(
+        lambda s: on_clean(s, 90.0)
+    )  # one clean minute after the cool-down
 
     restarted = RedisRateStore(fakeredis.FakeAsyncRedis(server=server), "gw:rate")
     after_restart = await restarted.load()

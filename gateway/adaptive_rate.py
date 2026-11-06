@@ -1,9 +1,11 @@
 """Adaptive provider rate for the shared account (petrosa-llm-gateway#3).
 
 AIMD on requests and tokens per minute: a provider 429 halves both and starts a cool-down
-(at least the provider's ``retry-after``); every clean minute since the last change adds
-one request per minute (and the matching token share) back. The cold start is a labelled
-fallback measured on 2026-11-05 (about 10 requests per minute for the shared account).
+(at least the provider's ``retry-after``); a clean minute in which the rate was the
+binding limit (the window was full) adds one request per minute (and the matching token
+share) back. Idle minutes add nothing, so a quiet period never builds up a rate the
+account has not been shown to take. The cold start is a labelled fallback measured on
+2026-11-05 (about 10 requests per minute for the shared account).
 
 Any provider 429 means the ACCOUNT is throttled: one key, one account, and the fallback
 model shares it. During the cool-down callers get an immediate ``account_throttled``
@@ -41,7 +43,8 @@ class RateState:
     rpm: float = COLD_START_RPM
     tpm: float = COLD_START_TPM
     cooldown_until: float = 0.0
-    last_change_at: float = 0.0
+    #: None until the first observation: a cold record has no history to count from.
+    last_change_at: float | None = None
     throttles: int = 0
 
     def to_json(self) -> str:
@@ -72,22 +75,29 @@ def on_throttled(
     )
 
 
-def on_clean(state: RateState, now: float) -> RateState:
-    """+1 request per minute (and its token share) for every clean minute since the last change."""
+def on_clean(state: RateState, now: float, saturated: bool = True) -> RateState:
+    """A clean call: +1 request per minute (and its token share) once a clean minute has
+    passed since the last change, if the rate was the binding limit (``saturated``).
+
+    One step per clean minute at most, however long the gap: idle time is not evidence
+    that the account takes more. The first observation of a cold record only starts the
+    clock.
+    """
     if now < state.cooldown_until:
         return state
+    if state.last_change_at is None:
+        return replace(state, last_change_at=now)
     since = max(state.last_change_at, state.cooldown_until)
-    minutes = int((now - since) // CLEAN_PERIOD_S)
-    if minutes <= 0:
+    if now - since < CLEAN_PERIOD_S or not saturated:
         return state
     tokens_per_request = (
         state.tpm / state.rpm if state.rpm > 0 else TOKENS_PER_REQUEST_FALLBACK
     )
     return replace(
         state,
-        rpm=state.rpm + minutes,
-        tpm=state.tpm + minutes * tokens_per_request,
-        last_change_at=since + minutes * CLEAN_PERIOD_S,
+        rpm=state.rpm + 1,
+        tpm=state.tpm + tokens_per_request,
+        last_change_at=now,
     )
 
 
