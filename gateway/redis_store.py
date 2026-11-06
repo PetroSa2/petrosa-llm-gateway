@@ -4,6 +4,10 @@ Every change is one optimistic transaction (WATCH / MULTI): read the queue and t
 decide with the same pure functions as the in-memory store, write, and retry when another
 replica changed the keys in between. The rate therefore holds across replicas.
 
+Every key expires: each write refreshes, in the same transaction, a TTL equal to the
+longest time any entry can matter (``key_ttl_s``). If every replica stops, the keys go
+away on their own; the shared Redis runs ``noeviction`` and holds other services' state.
+
 A waiting ticket refreshes its ``seen`` time on each poll. Tickets not seen for
 ``stale_after_s`` (a replica that died while its caller waited) are dropped by the next
 transaction, so they never block the queue. The clock must be comparable across replicas
@@ -13,6 +17,7 @@ transaction, so they never block the queue. The clock must be comparable across 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict
 from typing import Any
 
@@ -28,6 +33,13 @@ from gateway.scheduler import (
 )
 
 MAX_TRANSACTION_RETRIES = 20
+
+
+def key_ttl_s(config: SchedulingConfig, stale_after_s: float) -> int:
+    """How long any scheduler entry can matter: the window or the longest queue age, plus
+    the time a dead replica's ticket takes to go stale."""
+    longest_age = max((p.max_age_s for p in config.classes.values()), default=0.0)
+    return math.ceil(max(config.window_s, longest_age) + stale_after_s)
 
 
 class RedisStore:
@@ -87,6 +99,12 @@ class RedisStore:
             pipe.hdel(self.queue_key, *stale)
             pipe.hdel(self.seen_key, *stale)
 
+    def _expire(self, pipe: Any, config: SchedulingConfig) -> None:
+        """Refresh every key's TTL inside the current transaction."""
+        ttl = key_ttl_s(config, self.stale_after_s)
+        for key in (self.queue_key, self.seen_key, self.window_key):
+            pipe.expire(key, ttl)
+
     async def enqueue(
         self, config: SchedulingConfig, ticket: Ticket, now: float
     ) -> None:
@@ -99,6 +117,7 @@ class RedisStore:
             self._drop_stale(pipe, stale)
             pipe.hset(self.queue_key, ticket.ticket_id, json.dumps(asdict(ticket)))
             pipe.hset(self.seen_key, ticket.ticket_id, repr(now))
+            self._expire(pipe, config)
             await pipe.execute()
 
         await self._transaction(step)
@@ -125,6 +144,7 @@ class RedisStore:
                 pipe.zadd(self.window_key, {f"{ticket.cls}|{ticket.ticket_id}": now})
             else:
                 pipe.hset(self.seen_key, ticket.ticket_id, repr(now))
+            self._expire(pipe, config)
             await pipe.execute()
             return start
 
