@@ -118,6 +118,22 @@ def load_aliases(path: str | Path) -> list[str]:
     ]
 
 
+def alias_of(kwargs: Mapping[str, Any] | None) -> str | None:
+    """The Petrosa alias (model group) of a LiteLLM call, wherever this event carries it.
+
+    The deployment hook has it in ``metadata``; the logging events have it at the top level
+    or under ``litellm_params.metadata``.
+    """
+    kwargs = kwargs or {}
+    candidates = (
+        kwargs.get("model_group"),
+        (kwargs.get("metadata") or {}).get("model_group"),
+        ((kwargs.get("litellm_params") or {}).get("metadata") or {}).get("model_group"),
+        (kwargs.get("standard_logging_object") or {}).get("model_group"),
+    )
+    return next((c for c in candidates if isinstance(c, str) and c), None)
+
+
 def is_throttle(exception: BaseException | None) -> bool:
     """A provider 429: the account is throttled."""
     if exception is None:
@@ -400,8 +416,7 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
 
         async def async_pre_call_deployment_hook(self, kwargs, call_type):
             try:
-                metadata = kwargs.get("metadata") or {}
-                await self.policy.on_attempt(metadata, metadata.get("model_group"))
+                await self.policy.on_attempt(kwargs.get("metadata"), alias_of(kwargs))
             except SchedulingRefused as refused:
                 raise self._refusal(refused) from None
             return None
@@ -409,9 +424,7 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
         async def async_log_failure_event(
             self, kwargs, response_obj, start_time, end_time
         ):
-            await self.policy.on_failure(
-                kwargs.get("exception"), kwargs.get("model_group")
-            )
+            await self.policy.on_failure(kwargs.get("exception"), alias_of(kwargs))
 
         async def async_log_success_event(
             self, kwargs, response_obj, start_time, end_time

@@ -427,3 +427,25 @@ def test_build_policy_reads_aliases_and_callers_from_the_shipped_configs():
         "petrosa-primary": ["petrosa-fallback"],
         "petrosa-ops": ["petrosa-fallback"],
     }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "alias"),
+    [
+        ({"model_group": "petrosa-primary"}, "petrosa-primary"),
+        ({"metadata": {"model_group": "petrosa-fallback"}}, "petrosa-fallback"),
+        (
+            {"litellm_params": {"metadata": {"model_group": "petrosa-ops"}}},
+            "petrosa-ops",
+        ),
+        (
+            {"standard_logging_object": {"model_group": "petrosa-primary"}},
+            "petrosa-primary",
+        ),
+        ({"metadata": {"model_group": ""}}, None),
+        ({}, None),
+        (None, None),
+    ],
+)
+def test_alias_of(kwargs, alias):
+    assert hooks.alias_of(kwargs) == alias
