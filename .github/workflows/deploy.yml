@@ -1,0 +1,164 @@
+name: Deploy
+
+# Same shape as the other Petrosa services: tag a release, build and push the image on a
+# GitHub-hosted runner (the org runners have no Docker socket), then let the GitOps bot
+# set the image tag under petrosa_k8s/k8s/llm-gateway/. Until those manifests exist
+# (PetroSa2/petrosa_k8s#1465), the tag update finds nothing and commits nothing.
+
+"on":
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: petrosa-org-runners
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set version
+        id: version
+        run: |
+          BASE_VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)
+          [ -n "$BASE_VERSION" ] || { echo "no version in pyproject.toml"; exit 1; }
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          VERSION="${BASE_VERSION}-r${{ github.run_number }}-${SHORT_SHA}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+      - name: Create tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+
+  build-and-push:
+    name: Build & Push
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ needs.create-release.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/petrosa-llm-gateway
+          tags: |
+            type=raw,value=${{ needs.create-release.outputs.version }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  gitops-update:
+    name: GitOps Update
+    needs: [build-and-push, create-release]
+    runs-on: petrosa-org-runners
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Generate GitOps Bot Token
+        uses: tibdex/github-app-token@v2
+        id: generate-token
+        with:
+          app_id: ${{ secrets.GITOPS_APP_ID }}
+          private_key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          installation_retrieval_mode: id
+          installation_retrieval_payload: ${{ secrets.GITOPS_APP_INSTALLATION_ID }}
+
+      - name: Checkout petrosa_k8s
+        uses: actions/checkout@v4
+        with:
+          repository: PetroSa2/petrosa_k8s
+          ref: main
+          token: ${{ steps.generate-token.outputs.token }}
+          path: petrosa_k8s
+
+      - name: Mint umbrella checkout token
+        id: umbrella-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: PetroSa2
+          repositories: petrosa
+
+      - name: Check out agent tooling from the umbrella
+        uses: actions/checkout@v4
+        with:
+          repository: PetroSa2/petrosa
+          token: ${{ steps.umbrella-token.outputs.token }}
+          path: .agent-tooling
+          clean: false
+
+      - name: Put agent tooling on the expected path
+        run: |
+          ln -sfn ../.agent-tooling/scripts petrosa_k8s/scripts
+          test -f petrosa_k8s/scripts/gitops-rebase-main.sh
+
+      - name: Rebase on main
+        run: ./scripts/gitops-rebase-main.sh
+        working-directory: petrosa_k8s
+
+      - name: Update the llm-gateway image tag in the GitOps manifests
+        run: |
+          VERSION="${{ needs.build-and-push.outputs.version }}"
+          DIR=petrosa_k8s/k8s/llm-gateway
+          if [ ! -d "$DIR" ]; then
+            echo "No $DIR yet (PetroSa2/petrosa_k8s#1465): image pushed, nothing to update"
+            exit 0
+          fi
+          # Only the image tag and the version labels; the registry/repo prefix is kept.
+          find "$DIR" -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r sed -E -i "s|(image:[[:space:]]*)([^[:space:]]*/)?(petrosa-llm-gateway):[^[:space:]]*|\1\2\3:$VERSION|g"
+          find "$DIR" -type f \( -name "*.yaml" -o -name "*.yml" \) -print0 | xargs -0 -r sed -E -i "s/(app.kubernetes.io\/version):.*/\1: $VERSION/g"
+          echo "Updated the llm-gateway image tag to $VERSION"
+
+      - name: Commit and push to petrosa_k8s
+        working-directory: petrosa_k8s
+        run: |
+          git config user.name "gitops-bot"
+          git config user.email "gitops-bot@users.noreply.github.com"
+          [ -d k8s/llm-gateway ] || exit 0
+          git add k8s/llm-gateway/
+          if git diff --staged --quiet; then
+            echo "No changes to commit (version might already be up to date)"
+          else
+            git commit -m "gitops: llm-gateway image ${{ needs.build-and-push.outputs.version }}"
+            git push origin main
+          fi

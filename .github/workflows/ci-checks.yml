@@ -21,9 +21,9 @@ jobs:
       service-name: 'llm-gateway'
       image-name: 'yurisa2/petrosa-llm-gateway'
       python-version: '3.11'
-      # The image is published once the registry credentials exist
-      # (petrosa-llm-gateway#6); until then the image smoke job below
-      # builds and exercises it without pushing.
+      # The image is built and pushed by deploy.yml on merge to main, as in
+      # the other services; here the image smoke job below builds and
+      # exercises it without pushing.
       skip-docker-build: true
       coverage-threshold: '40'
     secrets: inherit
