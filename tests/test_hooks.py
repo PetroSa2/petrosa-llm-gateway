@@ -22,7 +22,7 @@ from gateway.scheduler import (
     SchedulingConfig,
     SchedulingRefused,
 )
-from tests.test_scheduler import RAW, VirtualTime
+from tests.test_scheduler import RAW, VirtualTime, fill_window
 
 
 @pytest.mark.parametrize(
@@ -238,9 +238,9 @@ async def test_other_failures_leave_the_rate_alone():
 
 
 @pytest.mark.asyncio
-async def test_clean_minutes_grow_the_rate_back_and_quiet_calls_write_nothing():
+async def test_the_rate_grows_only_while_it_is_the_binding_limit():
     rates = InMemoryRateStore(RateState(rpm=4, tpm=8_000, last_change_at=0.0))
-    gateway, vt, _ = policy(rates)
+    gateway, vt, store = policy(rates)
     writes = []
     update = rates.update
 
@@ -251,12 +251,28 @@ async def test_clean_minutes_grow_the_rate_back_and_quiet_calls_write_nothing():
     rates.update = counting_update  # type: ignore[method-assign]
 
     vt.now = 30.0
-    await gateway.on_success()
+    await gateway.on_success()  # less than a clean minute: nothing to do, no write
     assert writes == [] and (await rates.load()).rpm == 4
 
     vt.now = 125.0
+    fill_window(store, "ops", 2, at=100.0)  # 2 of 4 used: demand is below the rate
     await gateway.on_success()
-    assert len(writes) == 1 and (await rates.load()).rpm == 6
+    assert writes == [] and (await rates.load()).rpm == 4
+
+    fill_window(store, "trading", 2, at=110.0)  # 4 of 4: the rate is the limit
+    await gateway.on_success()
+    assert len(writes) == 1 and (await rates.load()).rpm == 5
+
+
+@pytest.mark.asyncio
+async def test_a_cold_record_starts_its_clock_on_the_first_success():
+    gateway, vt, _ = policy()
+    vt.now = 1_700_000_000.0
+
+    await gateway.on_success()
+
+    state = await gateway.rates.load()
+    assert state.rpm == COLD_START_RPM and state.last_change_at == 1_700_000_000.0
 
 
 @pytest.mark.asyncio

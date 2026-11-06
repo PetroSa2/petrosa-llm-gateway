@@ -208,11 +208,20 @@ class GatewayPolicy:
         return True
 
     async def on_success(self) -> None:
-        """A clean call: grow the rate by one per clean minute since the last change."""
+        """A clean call: one rpm back per clean minute, while the rate is the binding limit.
+
+        The window is read only when a step is due, so most calls cost one rate read.
+        """
         now = self.clock()
         state = await self.rates.load()
-        if on_clean(state, now) != state:
-            await self.rates.update(lambda s: on_clean(s, now))
+        if on_clean(state, now, saturated=True) == state:
+            return
+        config = await self.scheduler.effective_config()
+        _queue, window = await self.scheduler.store.snapshot(now)
+        recent = [s for s in window if s.at > now - config.window_s]
+        saturated = len(recent) >= config.rate_per_window
+        if on_clean(state, now, saturated) != state:
+            await self.rates.update(lambda s: on_clean(s, now, saturated))
 
 
 def build_scheduler(
