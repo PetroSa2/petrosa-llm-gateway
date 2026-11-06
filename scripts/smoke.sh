@@ -135,6 +135,19 @@ read -r P2 F2 <<<"$(calls)"
 THROTTLE_LOG="$(docker logs "${RUN_ID}-gateway" 2>&1)" # captured: grep -q on a pipe trips pipefail
 grep -q "provider throttled: rpm=5.0 .*x-ratelimit-remaining-requests" <<<"${THROTTLE_LOG}" \
   || fail "the 429 was not logged with the halved rate and its rate headers"
+METRICS="$(docker exec "${RUN_ID}-gateway" /app/.venv/bin/python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:9090/metrics", timeout=5).read().decode())')" \
+  || fail "no metrics on :9090"
+for expected in \
+  'llm_gateway_provider_throttles_total{alias="petrosa-primary"} 1.0' \
+  'llm_gateway_rate_rpm 5.0' \
+  'llm_gateway_attempts_total{alias="petrosa-fallback",caller="cio",class="trading",outcome="account_throttled"} 1.0' \
+  'llm_gateway_attempts_total{alias="petrosa-fallback",caller="cio",class="trading",outcome="started"} 1.0'; do
+  grep -qF -- "${expected}" <<<"${METRICS}" \
+    || fail "metrics lack: ${expected}; have: $(grep -E '^llm_gateway_(attempts|provider|rate_rpm)' <<<"${METRICS}" | tr '\n' ' ')"
+done
+for secret in "${PROVIDER_KEY}" "${MASTER_KEY}" "${CIO_KEY}" "${PROMPT}"; do
+  ! grep -qF -- "${secret}" <<<"${METRICS}" || fail "a key or the prompt text appeared in the metrics"
+done
 sleep 3.5 # the provider's retry-after
 mock POST /_control '{"reset": true}' >/dev/null
 
@@ -158,4 +171,4 @@ grep -q "PROVIDER_API_KEY loaded from .* (sha256:" <<<"${LOGS}" || fail "no prov
 IMAGE_ENV="$(docker image inspect "${IMAGE}" --format '{{json .Config.Env}}')"
 ! grep -qE "PROVIDER_API_KEY|LITELLM_MASTER_KEY" <<<"${IMAGE_ENV}" || fail "a key variable is baked into the image"
 
-echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 slow-primary=fallback 429=one-attempt+account_throttled probes=200-no-key logs=no-keys"
+echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 slow-primary=fallback 429=one-attempt+account_throttled metrics=:9090 probes=200-no-key logs=no-keys"
