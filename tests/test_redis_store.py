@@ -8,7 +8,7 @@ from typing import Any, cast
 import fakeredis
 import pytest
 
-from gateway.redis_store import RedisStore
+from gateway.redis_store import RedisStore, key_ttl_s
 from gateway.scheduler import (
     Scheduler,
     SchedulingConfig,
@@ -177,3 +177,34 @@ async def test_a_ticket_dropped_from_the_shared_queue_expires():
         await one.store.try_start(config, ticket, 1.0)
 
     assert refused.value.code == "queue_expired"
+
+
+def test_key_ttl_covers_the_window_and_the_longest_queue_age():
+    config = SchedulingConfig.from_mapping(RAW)
+    longest = max(p.max_age_s for p in config.classes.values())
+
+    assert key_ttl_s(config, 5.0) == int(max(config.window_s, longest) + 5.0)
+    short = SchedulingConfig.from_mapping({**RAW, "window_s": 10_000})
+    assert key_ttl_s(short, 0.5) == 10_001
+
+
+@pytest.mark.asyncio
+async def test_every_scheduler_key_expires():
+    """gw#13: the shared Redis runs noeviction; no gateway key may live forever."""
+    config, vt, (one,) = replicas(
+        {**RAW, "rate_per_window": 1, "window_s": 60}, count=1
+    )
+    redis = one.store.redis
+    expected = key_ttl_s(config, one.store.stale_after_s)
+
+    await one.admit("trading")  # enqueue, then start: the window holds it
+    waiting = asyncio.create_task(one.admit("ops"))  # stays queued: the window is full
+    await vt.settle()
+
+    for key in ("gw-test:queue", "gw-test:seen", "gw-test:window"):
+        ttl = await redis.ttl(key)
+        assert 0 < ttl <= expected, (key, ttl)
+
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
+    assert await redis.ttl("gw-test:window") > 0

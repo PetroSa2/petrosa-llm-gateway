@@ -19,6 +19,10 @@ functions of the record and the time.
 from __future__ import annotations
 
 import json
+import math
+import os
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Protocol
 
@@ -34,6 +38,20 @@ TOKENS_PER_REQUEST_FALLBACK = COLD_START_TPM / COLD_START_RPM
 #: Cool-down after a 429 that names no retry-after: one minute, the rate window.
 DEFAULT_COOLDOWN_S = 60.0
 CLEAN_PERIOD_S = 60.0
+RATE_RETENTION_ENV = "GATEWAY_RATE_RETENTION_S"
+#: Fallback only: a learned rate unused for a day is relearned from the cold start. The
+#: shared Redis runs ``noeviction``, so the record must expire on its own (gw#13).
+RATE_RETENTION_FALLBACK_S = 86_400.0
+
+
+def rate_retention_seconds(environ: Mapping[str, str]) -> float:
+    """How long an unused rate record is kept, from the environment or the fallback."""
+    raw = environ.get(RATE_RETENTION_ENV)
+    try:
+        value = float(raw) if raw is not None else RATE_RETENTION_FALLBACK_S
+    except ValueError:
+        return RATE_RETENTION_FALLBACK_S
+    return value if value > 0 else RATE_RETENTION_FALLBACK_S
 
 
 @dataclass(frozen=True)
@@ -156,15 +174,39 @@ class InMemoryRateStore:
 
 
 class RedisRateStore:
-    """The rate record in one Redis key: shared by replicas and kept across restarts."""
+    """The rate record in one Redis key: shared by replicas and kept across restarts.
 
-    def __init__(self, redis, key: str, retries: int = 20) -> None:
+    The key expires (gw#13): each read refreshes the retention, so only a record nobody
+    used for that long goes away, and each update keeps it at least until its cool-down
+    ends. An expired record reads as the cold start.
+    """
+
+    def __init__(
+        self,
+        redis,
+        key: str,
+        retries: int = 20,
+        retention_s: float | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
         self.redis = redis
         self.key = key
         self.retries = retries
+        self.retention_s = (
+            retention_s
+            if retention_s is not None
+            else rate_retention_seconds(os.environ)
+        )
+        self.clock = clock
+
+    def _ttl(self, state: RateState) -> int:
+        cooldown_left = max(0.0, state.cooldown_until - self.clock())
+        return math.ceil(max(self.retention_s, cooldown_left))
 
     async def load(self) -> RateState:
-        return RateState.from_json(await self.redis.get(self.key))
+        return RateState.from_json(
+            await self.redis.getex(self.key, ex=math.ceil(self.retention_s))
+        )
 
     async def update(self, change) -> RateState:
         from redis.exceptions import WatchError
@@ -175,7 +217,7 @@ class RedisRateStore:
                     await pipe.watch(self.key)
                     new = change(RateState.from_json(await pipe.get(self.key)))
                     pipe.multi()
-                    pipe.set(self.key, new.to_json())
+                    pipe.set(self.key, new.to_json(), ex=self._ttl(new))
                     await pipe.execute()
                     return new
                 except WatchError:
