@@ -79,6 +79,15 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/_seen":
+            # Provider calls per model so far: the smoke test counts attempts with it.
+            with self.server.lock:
+                counts: dict[str, int] = {}
+                for _path, model, _auth in self.server.seen:
+                    if model:
+                        counts[model] = counts.get(model, 0) + 1
+            self._reply(200, {"calls": counts})
+            return
         self._record(None)
         if self.path.rstrip("/").endswith("/models"):
             self._reply(

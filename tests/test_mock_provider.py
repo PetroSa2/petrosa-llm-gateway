@@ -83,3 +83,13 @@ def test_a_delay_rule_delays_the_answer(server):
 
     assert status == 200
     assert server.behaviour == {}
+
+
+def test_seen_counts_provider_calls_per_model(server):
+    _chat(server, PRIMARY)
+    _chat(server, PRIMARY)
+    _chat(server, FALLBACK)
+    with urllib.request.urlopen(  # noqa: S310 - local mock
+        server.url.removesuffix("/v1") + "/_seen", timeout=5
+    ) as response:
+        assert json.load(response) == {"calls": {PRIMARY: 2, FALLBACK: 1}}
