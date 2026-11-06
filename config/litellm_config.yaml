@@ -24,6 +24,11 @@ litellm_settings:
   # Prompt and completion bodies are never logged or stored.
   turn_off_message_logging: true
   json_logs: true
+  # Every provider call waits for its turn in the shared scheduler (gateway/hooks.py).
+  callbacks: gateway.hooks.proxy_handler_instance
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  # Callers are identified by static keys from mounted files, without a database;
+  # this hook also keeps caller keys off every non-inference route (gateway/callers.py).
+  custom_auth: gateway.callers.user_api_key_auth

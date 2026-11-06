@@ -34,6 +34,8 @@ class MockProvider(ThreadingHTTPServer):
     @property
     def url(self) -> str:
         host, port = self.server_address[:2]
+        if isinstance(host, bytes):
+            host = host.decode()
         return f"http://{host}:{port}/v1"
 
 

@@ -13,6 +13,7 @@ RUN_ID="gwsmoke-$$"
 SECRETS_DIR="$(mktemp -d)"
 PROVIDER_KEY="smoke-provider-$(openssl rand -hex 16)"
 MASTER_KEY="sk-smoke-$(openssl rand -hex 16)"
+CIO_KEY="cio-smoke-$(openssl rand -hex 16)"
 PROMPT="smoke-prompt-$(openssl rand -hex 8)"
 
 cleanup() {
@@ -26,8 +27,9 @@ fail() { echo "SMOKE FAIL: $*" >&2; docker logs "${RUN_ID}-gateway" 2>&1 | tail 
 
 printf '%s' "${PROVIDER_KEY}" > "${SECRETS_DIR}/provider-api-key"
 printf '%s' "${MASTER_KEY}" > "${SECRETS_DIR}/master-key"
-chmod 755 "${SECRETS_DIR}"
-chmod 644 "${SECRETS_DIR}"/*
+mkdir -p "${SECRETS_DIR}/callers"
+printf '%s' "${CIO_KEY}" > "${SECRETS_DIR}/callers/cio"
+chmod -R a+rX "${SECRETS_DIR}"
 
 docker build -q -t "${IMAGE}" . >/dev/null
 docker network create "${RUN_ID}" >/dev/null
@@ -58,6 +60,15 @@ HEALTH="$(curl -sf "${AUTH[@]}" "${BASE}/health")" || fail "/health failed"
 COUNTS="$(python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["healthy_count"], h["unhealthy_count"])' <<<"${HEALTH}")"
 [ "${COUNTS}" = "3 0" ] || fail "/health healthy/unhealthy: ${COUNTS}"
 
+# Kubernetes probes (petrosa_k8s#1465): liveness and readiness answer with no key at all;
+# /health (which calls every model) still needs the master key.
+for probe in /health/liveliness /health/readiness; do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}${probe}")"
+  [ "${CODE}" = "200" ] || fail "probe ${probe} without a key answered ${CODE}"
+done
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/health")"
+[ "${CODE}" = "401" ] || fail "/health without a key answered ${CODE}"
+
 REPLY="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' "${BASE}/v1/chat/completions" \
   -d "{\"model\":\"petrosa-primary\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}")" \
   || fail "chat completion failed"
@@ -65,7 +76,34 @@ python3 -c 'import json,sys; assert json.load(sys.stdin)["choices"][0]["message"
   || fail "unexpected chat reply"
 
 LOGS="$(docker logs "${RUN_ID}-gateway" 2>&1)"
-for secret in "${PROVIDER_KEY}" "${MASTER_KEY}" "${PROMPT}"; do
+CALLER=(-H "Authorization: Bearer ${CIO_KEY}")
+CHAT="{\"model\":\"petrosa-primary\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "${CALLER[@]}" -H 'Content-Type: application/json' "${BASE}/v1/chat/completions" -d "${CHAT}")"
+[ "${CODE}" = "200" ] || fail "the cio caller key got ${CODE} on chat completions"
+for route in /key/generate /model/new /config/update; do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${CALLER[@]}" -H 'Content-Type: application/json' "${BASE}${route}" -d '{}')"
+  [ "${CODE}" = "403" ] || fail "the cio caller key got ${CODE} on POST ${route}"
+done
+for route in /model/info /health; do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' "${CALLER[@]}" "${BASE}${route}")"
+  [ "${CODE}" = "403" ] || fail "the cio caller key got ${CODE} on GET ${route}"
+done
+INFO="$(curl -sf "${AUTH[@]}" "${BASE}/model/info")" || fail "/model/info failed for the master key"
+for secret in "${PROVIDER_KEY}" "${MASTER_KEY}"; do
+  ! grep -qF -- "${secret}" <<<"${INFO}" || fail "/model/info returned a key"
+done
+# Requests with a 100 ms budget run while the rate window has room; once it is full
+# (10 per window in config/scheduling.yaml) the next one is refused at once.
+REFUSED=""
+for _ in $(seq 1 15); do
+  REPLY="$(curl -s -w ' HTTP%{http_code}' "${CALLER[@]}" -H 'Content-Type: application/json' -H 'x-petrosa-deadline-ms: 100' "${BASE}/v1/chat/completions" -d "${CHAT}")"
+  if grep -q "HTTP503" <<<"${REPLY}"; then REFUSED="${REPLY}"; break; fi
+  grep -q "HTTP200" <<<"${REPLY}" || fail "a request inside the rate failed: ${REPLY: -12}"
+done
+grep -q "deadline_unmeetable" <<<"${REFUSED}" \
+  || fail "a full rate window did not refuse an unmeetable deadline with 503 deadline_unmeetable"
+
+for secret in "${PROVIDER_KEY}" "${MASTER_KEY}" "${CIO_KEY}" "${PROMPT}"; do
   ! grep -qF -- "${secret}" <<<"${LOGS}" || fail "a key or the prompt text appeared in the logs"
 done
 grep -q "PROVIDER_API_KEY loaded from .* (sha256:" <<<"${LOGS}" || fail "no provider key fingerprint in the logs"
@@ -73,4 +111,4 @@ grep -q "PROVIDER_API_KEY loaded from .* (sha256:" <<<"${LOGS}" || fail "no prov
 IMAGE_ENV="$(docker image inspect "${IMAGE}" --format '{{json .Config.Env}}')"
 ! grep -qE "PROVIDER_API_KEY|LITELLM_MASTER_KEY" <<<"${IMAGE_ENV}" || fail "a key variable is baked into the image"
 
-echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key logs=no-keys"
+echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 probes=200-no-key logs=no-keys"
