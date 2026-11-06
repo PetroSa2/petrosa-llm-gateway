@@ -449,3 +449,41 @@ def test_build_policy_reads_aliases_and_callers_from_the_shipped_configs():
 )
 def test_alias_of(kwargs, alias):
     assert hooks.alias_of(kwargs) == alias
+
+
+def test_response_headers_that_cannot_be_read_are_empty():
+    class Odd(Exception):
+        litellm_response_headers = 42  # not a mapping
+
+    assert hooks.response_headers(Odd()) == {}
+
+
+@pytest.mark.asyncio
+async def test_queue_depth_counts_waiting_requests_per_class():
+    from gateway.scheduler import Ticket, queue_key
+
+    gateway, vt, store, value = measured_policy()
+    config = gateway.scheduler.config
+    for i, cls in enumerate(["ops", "ops", "batch"]):
+        ticket = Ticket(f"t{i}", cls, 0.0, None, queue_key(config, cls, 0.0))
+        await store.enqueue(config, ticket, 0.0)
+
+    await gateway._observe(vt.now)
+
+    assert value("llm_gateway_queue_depth", {"class": "ops"}) == 2
+    assert value("llm_gateway_queue_depth", {"class": "batch"}) == 1
+    assert value("llm_gateway_queue_depth", {"class": "trading"}) == 0
+
+
+@pytest.mark.asyncio
+async def test_the_built_scheduler_reads_the_learned_rate():
+    gateway = hooks.build_policy(
+        {
+            "GATEWAY_SCHEDULING": "config/scheduling.yaml",
+            "GATEWAY_CONFIG": "config/litellm_config.yaml",
+        }
+    )
+    await gateway.rates.update(lambda s: hooks.on_throttled(s, 0.0, 30))
+
+    assert gateway.scheduler.rate is not None
+    assert await gateway.scheduler.rate() == COLD_START_RPM / 2

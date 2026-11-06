@@ -173,3 +173,8 @@ async def test_conflicting_updates_are_retried_then_given_up(monkeypatch):
     conflicts["left"] = 10
     with pytest.raises(RuntimeError):
         await store.update(lambda s: on_throttled(s, 1.0, 30))
+
+
+def test_no_headers_means_nothing_to_log():
+    assert rate_headers(None) == {}
+    assert rate_headers({}) == {}
