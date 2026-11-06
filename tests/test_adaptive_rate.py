@@ -10,12 +10,15 @@ from gateway.adaptive_rate import (
     COLD_START_TPM,
     DEFAULT_COOLDOWN_S,
     MIN_RPM,
+    RATE_RETENTION_ENV,
+    RATE_RETENTION_FALLBACK_S,
     InMemoryRateStore,
     RateState,
     RedisRateStore,
     on_clean,
     on_throttled,
     rate_headers,
+    rate_retention_seconds,
     retry_after_seconds,
     throttled,
 )
@@ -178,3 +181,50 @@ async def test_conflicting_updates_are_retried_then_given_up(monkeypatch):
 def test_no_headers_means_nothing_to_log():
     assert rate_headers(None) == {}
     assert rate_headers({}) == {}
+
+
+@pytest.mark.parametrize(
+    ("env", "seconds"),
+    [
+        ({}, RATE_RETENTION_FALLBACK_S),
+        ({RATE_RETENTION_ENV: "3600"}, 3600.0),
+        ({RATE_RETENTION_ENV: "0"}, RATE_RETENTION_FALLBACK_S),
+        ({RATE_RETENTION_ENV: "a day"}, RATE_RETENTION_FALLBACK_S),
+    ],
+)
+def test_rate_retention(env, seconds):
+    assert rate_retention_seconds(env) == seconds
+
+
+@pytest.mark.asyncio
+async def test_the_rate_key_expires_but_never_before_its_cool_down_ends():
+    """gw#13: the shared Redis runs noeviction; the rate record must expire on its own."""
+    redis = fakeredis.FakeAsyncRedis()
+    store = RedisRateStore(redis, "gw:rate", retention_s=600, clock=lambda: 0.0)
+
+    await store.update(lambda s: on_throttled(s, 0.0, 30))
+    assert 0 < await redis.ttl("gw:rate") <= 600
+
+    await store.update(
+        lambda s: on_throttled(s, 0.0, 5_000)
+    )  # a cool-down past retention
+    assert await redis.ttl("gw:rate") > 4_900
+
+
+@pytest.mark.asyncio
+async def test_reading_the_rate_refreshes_its_retention_and_expiry_is_a_cold_start():
+    redis = fakeredis.FakeAsyncRedis()
+    store = RedisRateStore(redis, "gw:rate", retention_s=600, clock=lambda: 0.0)
+    await store.update(lambda s: on_throttled(s, 0.0, 30))
+    await redis.expire("gw:rate", 5)
+
+    assert (await store.load()).throttles == 1
+    assert await redis.ttl("gw:rate") > 5  # in use: kept
+
+    await redis.delete("gw:rate")  # what expiry leaves behind
+    assert await store.load() == RateState()
+
+
+def test_the_store_reads_its_retention_from_the_environment(monkeypatch):
+    monkeypatch.setenv(RATE_RETENTION_ENV, "120")
+    assert RedisRateStore(fakeredis.FakeAsyncRedis(), "k").retention_s == 120.0
