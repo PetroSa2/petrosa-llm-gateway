@@ -60,6 +60,15 @@ HEALTH="$(curl -sf "${AUTH[@]}" "${BASE}/health")" || fail "/health failed"
 COUNTS="$(python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["healthy_count"], h["unhealthy_count"])' <<<"${HEALTH}")"
 [ "${COUNTS}" = "3 0" ] || fail "/health healthy/unhealthy: ${COUNTS}"
 
+# Kubernetes probes (petrosa_k8s#1465): liveness and readiness answer with no key at all;
+# /health (which calls every model) still needs the master key.
+for probe in /health/liveliness /health/readiness; do
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}${probe}")"
+  [ "${CODE}" = "200" ] || fail "probe ${probe} without a key answered ${CODE}"
+done
+CODE="$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/health")"
+[ "${CODE}" = "401" ] || fail "/health without a key answered ${CODE}"
+
 REPLY="$(curl -sf "${AUTH[@]}" -H 'Content-Type: application/json' "${BASE}/v1/chat/completions" \
   -d "{\"model\":\"petrosa-primary\",\"messages\":[{\"role\":\"user\",\"content\":\"${PROMPT}\"}]}")" \
   || fail "chat completion failed"
@@ -102,4 +111,4 @@ grep -q "PROVIDER_API_KEY loaded from .* (sha256:" <<<"${LOGS}" || fail "no prov
 IMAGE_ENV="$(docker image inspect "${IMAGE}" --format '{{json .Config.Env}}')"
 ! grep -qE "PROVIDER_API_KEY|LITELLM_MASTER_KEY" <<<"${IMAGE_ENV}" || fail "a key variable is baked into the image"
 
-echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 logs=no-keys"
+echo "smoke OK: aliases=[${IDS}] health=${COUNTS} auth=401-without-key caller=200-chat/403-admin deadline=503 probes=200-no-key logs=no-keys"
