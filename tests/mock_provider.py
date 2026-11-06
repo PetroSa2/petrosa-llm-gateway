@@ -30,6 +30,23 @@ class MockProvider(ThreadingHTTPServer):
         super().__init__(address, _Handler)
         self.seen: list[tuple[str, str | None, bool]] = []
         self.lock = threading.Lock()
+        #: Per upstream model (or "*" for all): {"status", "delay_s", "headers", "times"}.
+        #: Set with POST /_control; "times" counts down and the rule ends at 0 (absent = forever).
+        self.behaviour: dict[str, dict] = {}
+
+    def take_rule(self, model: str | None) -> dict | None:
+        """The rule for ``model`` (or the catch-all), consuming one use of it."""
+        with self.lock:
+            for key in (model or "", "*"):
+                rule = self.behaviour.get(key)
+                if rule is None:
+                    continue
+                if "times" in rule:
+                    rule["times"] -= 1
+                    if rule["times"] <= 0:
+                        del self.behaviour[key]
+                return dict(rule)
+        return None
 
     @property
     def url(self) -> str:
@@ -45,9 +62,11 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         """Keep the default per-request log quiet."""
 
-    def _reply(self, status: int, body: dict) -> None:
+    def _reply(self, status: int, body: dict, headers: dict | None = None) -> None:
         data = json.dumps(body).encode()
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(str(name), str(value))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -60,6 +79,15 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/_seen":
+            # Provider calls per model so far: the smoke test counts attempts with it.
+            with self.server.lock:
+                counts: dict[str, int] = {}
+                for _path, model, _auth in self.server.seen:
+                    if model:
+                        counts[model] = counts.get(model, 0) + 1
+            self._reply(200, {"calls": counts})
+            return
         self._record(None)
         if self.path.rstrip("/").endswith("/models"):
             self._reply(
@@ -78,8 +106,30 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
         payload = json.loads(self.rfile.read(length) or b"{}")
+        if self.path == "/_control":
+            with self.server.lock:
+                if payload.get("reset"):
+                    self.server.behaviour.clear()
+                for model, rule in (payload.get("rules") or {}).items():
+                    self.server.behaviour[model] = dict(rule)
+            self._reply(200, {"behaviour": self.server.behaviour})
+            return
         model = payload.get("model")
         self._record(model)
+        rule = self.server.take_rule(model)
+        if rule is not None:
+            if rule.get("delay_s"):
+                time.sleep(
+                    float(rule["delay_s"])
+                )  # the mock's simulated provider latency
+            status = int(rule.get("status", 200))
+            if status != 200:
+                self._reply(
+                    status,
+                    {"error": {"message": f"mock {status}", "type": "mock"}},
+                    headers=rule.get("headers") or {},
+                )
+                return
         if not self.path.rstrip("/").endswith("/chat/completions"):
             self._reply(404, {"error": {"message": "not found"}})
             return
