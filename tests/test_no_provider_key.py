@@ -116,4 +116,22 @@ def test_image_context_holds_only_code_and_config():
         "!gateway/",
         "!config/litellm_config.yaml",
         "!config/scheduling.yaml",
+        # Hash-pinned runtime dependencies for the builder stage (#4); no secrets.
+        "!requirements-image.txt",
     }
+
+
+def test_image_requirements_are_exact_and_hash_pinned():
+    text = (ROOT / "requirements-image.txt").read_text()
+    entries = " ".join(
+        line.strip().rstrip("\\").strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ).split()
+    names = [e for e in entries if not e.startswith("--hash=")]
+    hashes = [e for e in entries if e.startswith("--hash=sha256:")]
+    assert names and all(
+        re.fullmatch(r"[A-Za-z0-9_.-]+==[0-9][0-9A-Za-z.]*", n) for n in names
+    )
+    assert len(hashes) >= len(names)
+    assert all(re.fullmatch(r"--hash=sha256:[0-9a-f]{64}", h) for h in hashes)
