@@ -10,3 +10,4 @@ types-PyYAML==6.0.12.20241230
 bandit==1.7.8
 pre-commit==4.1.0
 prometheus-client==0.20.0
+petrosa-contracts==0.2.0
