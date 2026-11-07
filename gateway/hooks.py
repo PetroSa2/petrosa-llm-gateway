@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import time
+import uuid
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,13 @@ from gateway.attempts import (
     attempt_timeout,
     decide,
     remaining_budget,
+)
+from gateway.call_records import (
+    QUEUE_WAIT_KEY,
+    REQUEST_ID_KEY,
+    RecordPublisher,
+    build_publisher,
+    build_record,
 )
 from gateway.metrics import GatewayMetrics
 from gateway.scheduler import (
@@ -231,6 +239,10 @@ class GatewayPolicy:
         metadata = data.setdefault("metadata", {})
         metadata[CLASS_KEY] = cls
         metadata[CALLER_KEY] = caller
+        # Call records (#4): every attempt of this request shares the id; the wait is
+        # the time this request spent queued for admission.
+        metadata[REQUEST_ID_KEY] = uuid.uuid4().hex
+        metadata[QUEUE_WAIT_KEY] = max(0.0, self.clock() - now)
         if budget is not None:
             metadata[DEADLINE_AT_KEY] = now + budget
             remaining = max(0.0, now + budget - self.clock())
@@ -376,6 +388,27 @@ def build_policy(
     )
 
 
+def record_attempt(
+    publisher: RecordPublisher | None,
+    kwargs: Mapping[str, Any] | None,
+    response_obj: Any,
+    start_time: Any,
+    end_time: Any,
+    exception: BaseException | None = None,
+) -> None:
+    """Hand one attempt's record to the publisher; a record problem never touches the call."""
+    if publisher is None:
+        return
+    try:
+        publisher.offer(
+            build_record(
+                kwargs, response_obj, start_time, end_time, exception, alias_of(kwargs)
+            )
+        )
+    except Exception:  # noqa: BLE001 - records are best effort by design (#4)
+        logger.exception("call record dropped")
+
+
 try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
     from fastapi import HTTPException
     from litellm.integrations.custom_logger import CustomLogger
@@ -387,6 +420,7 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
             super().__init__()
             self._policy: GatewayPolicy | None = None
             self._metrics = GatewayMetrics()
+            self._records = build_publisher(os.environ)
             from gateway.metrics import serve
 
             serve(os.environ)
@@ -425,11 +459,20 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
             self, kwargs, response_obj, start_time, end_time
         ):
             await self.policy.on_failure(kwargs.get("exception"), alias_of(kwargs))
+            record_attempt(
+                self._records,
+                kwargs,
+                response_obj,
+                start_time,
+                end_time,
+                kwargs.get("exception"),
+            )
 
         async def async_log_success_event(
             self, kwargs, response_obj, start_time, end_time
         ):
             await self.policy.on_success()
+            record_attempt(self._records, kwargs, response_obj, start_time, end_time)
 
     proxy_handler_instance: Any = SchedulingHook()
 except ImportError:  # pragma: no cover - tests run without LiteLLM
