@@ -201,3 +201,105 @@ def test_records_are_off_without_a_nats_url():
     assert build_publisher({}) is None
     publisher = build_publisher({"GATEWAY_NATS_URL": "nats://nats.example:4222"})
     assert publisher is not None and publisher.subject == "petrosa.llm.call_record.v1"
+
+
+# --- edge paths ----------------------------------------------------------------------
+
+
+def test_numeric_and_missing_timestamps():
+    record = build_record(_kwargs(), None, 1_794_000_000.0, 1_794_000_002.5)
+    assert record["started_at"].startswith("2026-") and record["started_at"].endswith(
+        "+00:00"
+    )
+    assert record["latency_ms"] == 2500.0
+    unknown = build_record(_kwargs(), None, None, None)
+    assert unknown["latency_ms"] == 0.0 and unknown["started_at"].endswith("+00:00")
+
+
+def test_offer_outside_a_running_loop_only_buffers(tmp_path):
+    publisher = RecordPublisher(FakeNats().send, spool_path=tmp_path / "s.jsonl")
+    assert publisher.offer({"n": 1}) is True  # no event loop: buffered, no task started
+    assert publisher.queue.qsize() == 1 and publisher._task is None
+
+
+def test_a_spool_write_failure_drops_and_counts(tmp_path):
+    publisher = RecordPublisher(FakeNats().send, spool_path=tmp_path)  # a directory
+    publisher._spool({"n": 1})
+    assert publisher.dropped == 1 and publisher.spooled == 0
+
+
+def test_replay_keeps_the_rest_after_a_failure(tmp_path):
+    async def scenario():
+        spool = tmp_path / "s.jsonl"
+        sent = []
+
+        async def flaky(subject, payload):
+            n = json.loads(payload)["n"]
+            if n == 1:
+                raise ConnectionError("down again")
+            sent.append(n)
+
+        publisher = RecordPublisher(flaky, spool_path=spool)
+        assert await publisher.replay_spool() == 0  # nothing spooled yet
+        spool.write_text("".join(json.dumps({"n": i}) + "\n" for i in range(3)))
+        assert await publisher.replay_spool() == 1
+        assert sent == [0]
+        assert [json.loads(line)["n"] for line in spool.read_text().splitlines()] == [
+            1,
+            2,
+        ]
+
+    asyncio.run(scenario())
+
+
+class _FakeNatsClient:
+    def __init__(self, closed=False):
+        self.is_closed = closed
+        self.published = []
+
+    async def publish(self, subject, payload):
+        self.published.append((subject, payload))
+
+
+def _fake_nats(monkeypatch, closed):
+    import sys
+    import types
+
+    connects = []
+
+    async def connect(**kwargs):
+        connects.append(kwargs)
+        return _FakeNatsClient(closed=closed)
+
+    monkeypatch.setitem(sys.modules, "nats", types.SimpleNamespace(connect=connect))
+    return connects
+
+
+def test_nats_sender_connects_lazily_once_and_parses_servers(monkeypatch):
+    from gateway.call_records import nats_sender
+
+    connects = _fake_nats(monkeypatch, closed=False)
+    send = nats_sender("nats://a:4222, nats://b:4222,")
+
+    async def scenario():
+        await send("s", b"1")
+        await send("s", b"2")
+
+    asyncio.run(scenario())
+    assert len(connects) == 1  # the open client is reused
+    assert connects[0]["servers"] == ["nats://a:4222", "nats://b:4222"]
+    assert connects[0]["max_reconnect_attempts"] == -1
+
+
+def test_nats_sender_reconnects_when_the_client_is_closed(monkeypatch):
+    from gateway.call_records import nats_sender
+
+    connects = _fake_nats(monkeypatch, closed=True)
+    send = nats_sender("nats://c:4222")
+
+    async def scenario():
+        await send("s", b"x")
+        await send("s", b"y")
+
+    asyncio.run(scenario())
+    assert len(connects) == 2 and connects[0]["servers"] == ["nats://c:4222"]
