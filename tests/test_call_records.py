@@ -102,7 +102,8 @@ def test_outcomes(exception, outcome):
 
 
 def test_records_validate_against_the_shared_contract():
-    contracts = pytest.importorskip("petrosa_contracts")
+    import petrosa_contracts as contracts  # pinned in requirements-dev.txt (0.2.0)
+
     record = build_record(
         _kwargs(previous=["RateLimitError"]),
         None,
