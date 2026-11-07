@@ -1,0 +1,6 @@
+# Runtime dependencies the gateway adds to the pinned LiteLLM image (petrosa-llm-gateway#4).
+# Installed with --require-hashes --no-deps in a builder stage (see Dockerfile). Pin exact
+# versions at least two weeks old; nats-py has no required dependencies.
+nats-py==2.16.0 \
+    --hash=sha256:aeb1ff123966c05833d26c7df7e1d54c1c6d32b612428b21677a2e921f1fecae \
+    --hash=sha256:1d137ed7afc9b59033b3199324c6237df2016a5091935871344a787eba6b72fc

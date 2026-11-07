@@ -487,3 +487,48 @@ async def test_the_built_scheduler_reads_the_learned_rate():
 
     assert gateway.scheduler.rate is not None
     assert await gateway.scheduler.rate() == COLD_START_RPM / 2
+
+
+@pytest.mark.asyncio
+async def test_a_request_gets_a_request_id_and_its_admission_wait_for_call_records():
+    gateway, _vt, _store = policy()
+    first, second = {"model": "petrosa-primary"}, {"model": "petrosa-primary"}
+    await gateway.on_request(TRADING, None, first)
+    await gateway.on_request(TRADING, None, second)
+    ids = [d["metadata"][hooks.REQUEST_ID_KEY] for d in (first, second)]
+    assert all(isinstance(i, str) and len(i) == 32 for i in ids)
+    assert ids[0] != ids[1]
+    assert first["metadata"][hooks.QUEUE_WAIT_KEY] >= 0
+
+
+def test_record_attempt_hands_a_record_over_and_never_raises():
+    class Publisher:
+        def __init__(self, fail=False):
+            self.fail, self.records = fail, []
+
+        def offer(self, record):
+            if self.fail:
+                raise RuntimeError("boom")
+            self.records.append(record)
+
+    kwargs = {
+        "model_group": "petrosa-ops",
+        "litellm_params": {
+            "metadata": {
+                hooks.REQUEST_ID_KEY: "r1",
+                hooks.CALLER_KEY: "holmes",
+                hooks.CLASS_KEY: "ops",
+            }
+        },
+    }
+    publisher = Publisher()
+    hooks.record_attempt(publisher, kwargs, None, 0.0, 1.0, RateLimitError())
+    (record,) = publisher.records
+    assert (record["caller"], record["priority_class"], record["model_alias"]) == (
+        "holmes",
+        "ops",
+        "petrosa-ops",
+    )
+    assert record["outcome"] == "throttled" and record["attempt_no"] == 1
+    hooks.record_attempt(Publisher(fail=True), kwargs, None, 0.0, 1.0)  # no raise
+    hooks.record_attempt(None, kwargs, None, 0.0, 1.0)  # records off
