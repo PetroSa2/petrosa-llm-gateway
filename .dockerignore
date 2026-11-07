@@ -3,4 +3,5 @@
 !gateway/
 !config/litellm_config.yaml
 !config/scheduling.yaml
+!requirements-image.txt
 **/__pycache__
