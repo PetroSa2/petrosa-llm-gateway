@@ -1,5 +1,6 @@
-# Only the gateway package and the proxy config go into the image.
+# Only the gateway package, its requirements and the proxy config go into the image.
 *
 !gateway/
+!requirements.txt
 !config/litellm_config.yaml
 **/__pycache__

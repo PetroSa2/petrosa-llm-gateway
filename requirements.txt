@@ -1,2 +1,3 @@
-# The gateway's own code (gateway/) uses only the standard library.
-# The proxy and its dependencies come from the pinned LiteLLM base image (see Dockerfile).
+# Runtime dependencies installed into the LiteLLM base-image venv.
+nats-py>=2.7.0
+petrosa-contracts==0.2.0

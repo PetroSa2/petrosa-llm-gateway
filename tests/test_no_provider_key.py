@@ -114,5 +114,6 @@ def test_image_context_holds_only_code_and_config():
     assert lines[0] == "*"
     assert {line for line in lines if line.startswith("!")} == {
         "!gateway/",
+        "!requirements.txt",
         "!config/litellm_config.yaml",
     }

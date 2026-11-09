@@ -8,6 +8,10 @@ ENV PROVIDER_API_BASE=https://integrate.api.nvidia.com/v1 \
     PYTHONPATH=/opt/llm-gateway \
     PYTHONDONTWRITEBYTECODE=1
 
+COPY requirements.txt /tmp/gateway-requirements.txt
+RUN /app/.venv/bin/pip install --no-cache-dir -r /tmp/gateway-requirements.txt \
+    && rm /tmp/gateway-requirements.txt
+
 COPY gateway/ /opt/llm-gateway/gateway/
 COPY config/litellm_config.yaml /etc/llm-gateway/litellm_config.yaml
 

@@ -24,6 +24,8 @@ litellm_settings:
   # Prompt and completion bodies are never logged or stored.
   turn_off_message_logging: true
   json_logs: true
+  success_callback: ["gateway.call_records.on_success"]
+  failure_callback: ["gateway.call_records.on_failure"]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
