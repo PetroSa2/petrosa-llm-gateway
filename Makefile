@@ -7,7 +7,7 @@ BIN := $(VENV)/bin
 COVERAGE_THRESHOLD := 40
 IMAGE_NAME := petrosa-llm-gateway
 
-.PHONY: help setup clean format lint type-check test security smoke pipeline validate-python
+.PHONY: help setup clean format lint type-check test security smoke load-test pipeline validate-python
 .DEFAULT_GOAL := help
 
 help: ## Show this help message
@@ -48,6 +48,9 @@ security: $(BIN)/pytest ## Run security scans (Bandit)
 
 smoke: ## Build the image and check it against the mock provider
 	IMAGE_NAME=$(IMAGE_NAME) scripts/smoke.sh
+
+load-test: validate-python $(BIN)/pytest ## Replay CIO and Holmes burst against the mock provider
+	$(BIN)/python scripts/load_test.py --calls 18 --max-p95-wait 30
 
 pipeline: validate-python ## Run the complete CI pipeline locally
 	$(MAKE) clean

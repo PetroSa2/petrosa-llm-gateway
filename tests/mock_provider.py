@@ -48,6 +48,14 @@ class MockProvider(ThreadingHTTPServer):
                 return dict(rule)
         return None
 
+    def set_behaviour(self, rules: dict[str, dict], reset: bool = False) -> None:
+        """Replace programmable rules without requiring an HTTP control client."""
+        with self.lock:
+            if reset:
+                self.behaviour.clear()
+            for model, rule in rules.items():
+                self.behaviour[model] = dict(rule)
+
     @property
     def url(self) -> str:
         host, port = self.server_address[:2]

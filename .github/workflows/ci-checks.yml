@@ -38,3 +38,19 @@ jobs:
         uses: actions/checkout@v4
       - name: Build the image and check it against the mock provider
         run: scripts/smoke.sh
+
+  load-test:
+    name: Load Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: python -m pip install -q -r requirements.txt -r requirements-dev.txt
+      - name: Replay CIO and Holmes burst
+        run: make load-test
