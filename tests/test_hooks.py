@@ -307,10 +307,124 @@ def test_response_headers_and_throttle_detection():
     assert not hooks.is_throttle(TimeoutError())
 
 
+def test_queue_full_retry_after_normalizes_invalid_values(monkeypatch):
+    gateway, _, _ = policy()
+
+    monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "invalid")
+    assert gateway.queue_full_retry_after == 1
+
+    monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "0")
+    assert gateway.queue_full_retry_after == 1
+
+
 def test_refusal_headers_follow_error_policy(monkeypatch):
     monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "4")
     refusal = hooks.SchedulingHook._refusal(SchedulingRefused("queue_full", "full"))
     assert refusal.headers == {"Retry-After": "4"}
+    assert (
+        hooks.SchedulingHook._refusal(SchedulingRefused("other", "detail")).headers
+        is None
+    )
+    monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "invalid")
+    assert hooks.SchedulingHook._refusal(
+        SchedulingRefused("queue_full", "full")
+    ).headers == {"Retry-After": "1"}
+
+
+@pytest.mark.asyncio
+async def test_scheduling_hook_refuses_queue_full_with_retry_after(monkeypatch):
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = policy()[0]
+    hook._metrics = None
+    hook._records = None
+    monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "6")
+
+    async def refuse(*args, **kwargs):
+        raise SchedulingRefused("queue_full", "full")
+
+    hook.policy.on_request = refuse
+    with pytest.raises(hooks.HTTPException) as raised:
+        await hook.async_pre_call_hook(None, None, {}, None)
+    assert raised.value.headers == {"Retry-After": "6"}
+
+
+@pytest.mark.asyncio
+async def test_scheduling_hook_refuses_throttled_request_with_remaining_cooldown():
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = policy()[0]
+    hook._metrics = None
+    hook._records = None
+    hook.policy.rates = InMemoryRateStore(RateState(cooldown_until=8.2))
+    hook.policy.clock = lambda: 5.0
+
+    async def refuse(*args, **kwargs):
+        raise SchedulingRefused("account_throttled", "cooldown")
+
+    hook.policy.on_request = refuse
+    with pytest.raises(hooks.HTTPException) as raised:
+        await hook.async_pre_call_hook(None, None, {}, None)
+    assert raised.value.headers == {"Retry-After": "4"}
+
+
+@pytest.mark.asyncio
+async def test_scheduling_hook_deployment_refusal_uses_retry_after(monkeypatch):
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = policy()[0]
+    hook._metrics = None
+    hook._records = None
+    monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "3")
+
+    async def refuse(*args, **kwargs):
+        raise SchedulingRefused("queue_full", "full")
+
+    hook.policy.on_attempt = refuse
+    with pytest.raises(hooks.HTTPException) as raised:
+        await hook.async_pre_call_deployment_hook({}, None)
+    assert raised.value.headers == {"Retry-After": "3"}
+
+
+@pytest.mark.asyncio
+async def test_scheduling_hook_logs_success_and_failure(monkeypatch):
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = policy()[0]
+    hook._metrics = None
+    hook._records = None
+    calls = []
+    monkeypatch.setattr(hooks, "record_attempt", lambda *args: calls.append(args))
+
+    kwargs = {"metadata": {}, "exception": TimeoutError(), "model": "petrosa-primary"}
+    await hook.async_log_failure_event(kwargs, None, 1.0, 2.0)
+    await hook.async_log_success_event(kwargs, None, 1.0, 2.0)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduling_hook_returns_data_and_none_on_success():
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = policy()[0]
+    hook._metrics = None
+    hook._records = None
+    data = {"model": "petrosa-primary"}
+    assert await hook.async_pre_call_hook(None, None, data, None) is data
+    assert await hook.async_pre_call_deployment_hook({}, None) is None
+
+
+@pytest.mark.asyncio
+async def test_scheduling_hook_deployment_refusal_uses_cooldown():
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = policy()[0]
+    hook._metrics = None
+    hook._records = None
+    hook.policy.rates = InMemoryRateStore(RateState(cooldown_until=8.2))
+    hook.policy.clock = lambda: 5.0
+
+    async def refuse(*args, **kwargs):
+        raise SchedulingRefused("account_throttled", "cooldown")
+
+    hook.policy.on_attempt = refuse
+    with pytest.raises(hooks.HTTPException) as raised:
+        await hook.async_pre_call_deployment_hook({}, None)
+    assert raised.value.headers == {"Retry-After": "4"}
 
 
 def test_load_fallbacks(tmp_path):
