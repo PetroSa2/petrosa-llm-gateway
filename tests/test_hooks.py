@@ -309,9 +309,8 @@ def test_response_headers_and_throttle_detection():
 
 def test_refusal_headers_follow_error_policy(monkeypatch):
     monkeypatch.setenv("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "4")
-    assert hooks.SchedulingHook._refusal(
-        SchedulingRefused("queue_full", "full")
-    ).headers == {"Retry-After": "4"}
+    refusal = hooks.SchedulingHook._refusal(SchedulingRefused("queue_full", "full"))
+    assert refusal.headers == {"Retry-After": "4"}
 
 
 def test_load_fallbacks(tmp_path):

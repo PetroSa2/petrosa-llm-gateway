@@ -421,98 +421,105 @@ def record_attempt(
 try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
     from fastapi import HTTPException
     from litellm.integrations.custom_logger import CustomLogger
-
-    class SchedulingHook(CustomLogger):
-        """Admits each provider attempt through the shared scheduler and learned rate."""
-
-        def __init__(self) -> None:
-            super().__init__()
-            self._policy: GatewayPolicy | None = None
-            self._metrics = GatewayMetrics()
-            self._records = build_publisher(os.environ)
-            from gateway.metrics import serve
-
-            serve(os.environ)
-
-        @property
-        def policy(self) -> GatewayPolicy:
-            if self._policy is None:
-                self._policy = build_policy(os.environ, self._metrics)
-            return self._policy
-
-        @staticmethod
-        def _refusal(
-            refused: SchedulingRefused, retry_after: int | None = None
-        ) -> HTTPException:
-            if retry_after is None and refused.code == "queue_full":
-                try:
-                    retry_after = int(
-                        os.environ.get("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "1")
-                    )
-                except ValueError:
-                    retry_after = 1
-                retry_after = max(1, retry_after)
-            headers = (
-                {"Retry-After": str(retry_after)} if retry_after is not None else None
-            )
-            return HTTPException(
-                status_code=503,
-                detail={"error": refused.code, "detail": refused.detail},
-                headers=headers,
-            )
-
-        async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-            headers = (data.get("proxy_server_request") or {}).get("headers")
-            try:
-                await self.policy.on_request(
-                    getattr(user_api_key_dict, "metadata", None), headers, data
-                )
-            except SchedulingRefused as refused:
-                retry_after = None
-                if refused.code == "account_throttled":
-                    state = await self.policy.rates.load()
-                    retry_after = max(
-                        1, math.ceil(state.cooldown_until - self.policy.clock())
-                    )
-                elif refused.code == "queue_full":
-                    retry_after = self.policy.queue_full_retry_after
-                raise self._refusal(refused, retry_after) from None
-            return data
-
-        async def async_pre_call_deployment_hook(self, kwargs, call_type):
-            try:
-                await self.policy.on_attempt(kwargs.get("metadata"), alias_of(kwargs))
-            except SchedulingRefused as refused:
-                retry_after = None
-                if refused.code == "account_throttled":
-                    state = await self.policy.rates.load()
-                    retry_after = max(
-                        1, math.ceil(state.cooldown_until - self.policy.clock())
-                    )
-                elif refused.code == "queue_full":
-                    retry_after = self.policy.queue_full_retry_after
-                raise self._refusal(refused, retry_after) from None
-            return None
-
-        async def async_log_failure_event(
-            self, kwargs, response_obj, start_time, end_time
-        ):
-            await self.policy.on_failure(kwargs.get("exception"), alias_of(kwargs))
-            record_attempt(
-                self._records,
-                kwargs,
-                response_obj,
-                start_time,
-                end_time,
-                kwargs.get("exception"),
-            )
-
-        async def async_log_success_event(
-            self, kwargs, response_obj, start_time, end_time
-        ):
-            await self.policy.on_success()
-            record_attempt(self._records, kwargs, response_obj, start_time, end_time)
-
-    proxy_handler_instance: Any = SchedulingHook()
 except ImportError:  # pragma: no cover - tests run without LiteLLM
-    proxy_handler_instance = None
+
+    class HTTPException(Exception):
+        def __init__(
+            self, status_code: int, detail: Any, headers: dict[str, str] | None = None
+        ):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+            self.headers = headers
+
+    class CustomLogger:
+        pass
+
+
+class SchedulingHook(CustomLogger):
+    """Admits each provider attempt through the shared scheduler and learned rate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._policy: GatewayPolicy | None = None
+        self._metrics = GatewayMetrics()
+        self._records = build_publisher(os.environ)
+        from gateway.metrics import serve
+
+        serve(os.environ)
+
+    @property
+    def policy(self) -> GatewayPolicy:
+        if self._policy is None:
+            self._policy = build_policy(os.environ, self._metrics)
+        return self._policy
+
+    @staticmethod
+    def _refusal(
+        refused: SchedulingRefused, retry_after: int | None = None
+    ) -> HTTPException:
+        if retry_after is None and refused.code == "queue_full":
+            try:
+                retry_after = int(
+                    os.environ.get("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "1")
+                )
+            except ValueError:
+                retry_after = 1
+            retry_after = max(1, retry_after)
+        headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+        return HTTPException(
+            status_code=503,
+            detail={"error": refused.code, "detail": refused.detail},
+            headers=headers,
+        )
+
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        headers = (data.get("proxy_server_request") or {}).get("headers")
+        try:
+            await self.policy.on_request(
+                getattr(user_api_key_dict, "metadata", None), headers, data
+            )
+        except SchedulingRefused as refused:
+            retry_after = None
+            if refused.code == "account_throttled":
+                state = await self.policy.rates.load()
+                retry_after = max(
+                    1, math.ceil(state.cooldown_until - self.policy.clock())
+                )
+            elif refused.code == "queue_full":
+                retry_after = self.policy.queue_full_retry_after
+            raise self._refusal(refused, retry_after) from None
+        return data
+
+    async def async_pre_call_deployment_hook(self, kwargs, call_type):
+        try:
+            await self.policy.on_attempt(kwargs.get("metadata"), alias_of(kwargs))
+        except SchedulingRefused as refused:
+            retry_after = None
+            if refused.code == "account_throttled":
+                state = await self.policy.rates.load()
+                retry_after = max(
+                    1, math.ceil(state.cooldown_until - self.policy.clock())
+                )
+            elif refused.code == "queue_full":
+                retry_after = self.policy.queue_full_retry_after
+            raise self._refusal(refused, retry_after) from None
+        return None
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        await self.policy.on_failure(kwargs.get("exception"), alias_of(kwargs))
+        record_attempt(
+            self._records,
+            kwargs,
+            response_obj,
+            start_time,
+            end_time,
+            kwargs.get("exception"),
+        )
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        await self.policy.on_success()
+        record_attempt(self._records, kwargs, response_obj, start_time, end_time)
+
+
+proxy_handler_instance: Any = SchedulingHook()
