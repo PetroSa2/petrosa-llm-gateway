@@ -444,7 +444,17 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
         def _refusal(
             refused: SchedulingRefused, retry_after: int | None = None
         ) -> HTTPException:
-            headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+            if retry_after is None and refused.code == "queue_full":
+                try:
+                    retry_after = int(
+                        os.environ.get("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "1")
+                    )
+                except ValueError:
+                    retry_after = 1
+                retry_after = max(1, retry_after)
+            headers = (
+                {"Retry-After": str(retry_after)} if retry_after is not None else None
+            )
             return HTTPException(
                 status_code=503,
                 detail={"error": refused.code, "detail": refused.detail},
@@ -461,7 +471,9 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
                 retry_after = None
                 if refused.code == "account_throttled":
                     state = await self.policy.rates.load()
-                    retry_after = max(1, math.ceil(state.cooldown_until - self.policy.clock()))
+                    retry_after = max(
+                        1, math.ceil(state.cooldown_until - self.policy.clock())
+                    )
                 elif refused.code == "queue_full":
                     retry_after = self.policy.queue_full_retry_after
                 raise self._refusal(refused, retry_after) from None
@@ -474,7 +486,9 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
                 retry_after = None
                 if refused.code == "account_throttled":
                     state = await self.policy.rates.load()
-                    retry_after = max(1, math.ceil(state.cooldown_until - self.policy.clock()))
+                    retry_after = max(
+                        1, math.ceil(state.cooldown_until - self.policy.clock())
+                    )
                 elif refused.code == "queue_full":
                     retry_after = self.policy.queue_full_retry_after
                 raise self._refusal(refused, retry_after) from None
