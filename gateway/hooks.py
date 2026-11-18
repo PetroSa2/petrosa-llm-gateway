@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 import uuid
@@ -184,6 +185,14 @@ class GatewayPolicy:
         self.metrics = metrics
         self.aliases = frozenset(aliases)
         self.callers = frozenset(callers)
+
+    @property
+    def queue_full_retry_after(self) -> int:
+        try:
+            value = int(os.environ.get("GATEWAY_QUEUE_FULL_RETRY_AFTER_S", "1"))
+        except ValueError:
+            value = 1
+        return max(1, value)
 
     def _alias(self, alias: Any) -> str:
         """A bounded metric label: a configured Petrosa alias, else ``other``."""
@@ -432,10 +441,14 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
             return self._policy
 
         @staticmethod
-        def _refusal(refused: SchedulingRefused) -> HTTPException:
+        def _refusal(
+            refused: SchedulingRefused, retry_after: int | None = None
+        ) -> HTTPException:
+            headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
             return HTTPException(
                 status_code=503,
                 detail={"error": refused.code, "detail": refused.detail},
+                headers=headers,
             )
 
         async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
@@ -445,14 +458,26 @@ try:  # pragma: no cover - the adapter needs LiteLLM, present only in the image
                     getattr(user_api_key_dict, "metadata", None), headers, data
                 )
             except SchedulingRefused as refused:
-                raise self._refusal(refused) from None
+                retry_after = None
+                if refused.code == "account_throttled":
+                    state = await self.policy.rates.load()
+                    retry_after = max(1, math.ceil(state.cooldown_until - self.policy.clock()))
+                elif refused.code == "queue_full":
+                    retry_after = self.policy.queue_full_retry_after
+                raise self._refusal(refused, retry_after) from None
             return data
 
         async def async_pre_call_deployment_hook(self, kwargs, call_type):
             try:
                 await self.policy.on_attempt(kwargs.get("metadata"), alias_of(kwargs))
             except SchedulingRefused as refused:
-                raise self._refusal(refused) from None
+                retry_after = None
+                if refused.code == "account_throttled":
+                    state = await self.policy.rates.load()
+                    retry_after = max(1, math.ceil(state.cooldown_until - self.policy.clock()))
+                elif refused.code == "queue_full":
+                    retry_after = self.policy.queue_full_retry_after
+                raise self._refusal(refused, retry_after) from None
             return None
 
         async def async_log_failure_event(
