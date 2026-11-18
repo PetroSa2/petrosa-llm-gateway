@@ -409,6 +409,15 @@ async def test_scheduling_hook_returns_data_and_none_on_success():
     assert await hook.async_pre_call_deployment_hook({}, None) is None
 
 
+def test_scheduling_hook_lazily_builds_policy(monkeypatch):
+    hook = object.__new__(hooks.SchedulingHook)
+    hook._policy = None
+    hook._metrics = None
+    monkeypatch.setattr(hooks, "build_policy", lambda environ, metrics: "policy")
+    assert hook.policy == "policy"
+    assert hook.policy == "policy"
+
+
 @pytest.mark.asyncio
 async def test_scheduling_hook_deployment_refusal_uses_cooldown():
     hook = object.__new__(hooks.SchedulingHook)
